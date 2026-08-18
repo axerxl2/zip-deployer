@@ -273,6 +273,40 @@ class TestRateLimitCompliance(DeployTestCase):
         self.assertEqual(len(self.remote_files()), 3000)
 
 
+class TestPayloadBounds(DeployTestCase):
+    """Packing many files per request must not produce oversized payloads."""
+
+    def test_cjk_content_stays_within_the_payload_budget(self):
+        # Pure CJK + emoji: 3-4 bytes per character, and the worst case for
+        # any size estimate that counts characters instead of bytes.
+        body = ("日本語のページ 🚀 Ünïcödé\n" * 200).encode("utf-8")
+        files = {f"src/pages/page{i:04d}.astro": body for i in range(400)}
+        # Vary content so deduplication does not hide the problem.
+        files = {
+            f"src/pages/page{i:04d}.astro": body + f"// {i}\n".encode()
+            for i in range(400)
+        }
+        self.deploy(build_zip(files))
+        largest = self.backend.stats.max_request_bytes
+        self.assertLess(largest, 6 * 1024 * 1024,
+                        f"tree payload grew to {largest / 1e6:.1f} MB")
+        remote = self.remote_files()
+        self.assertEqual(len(remote), 400)
+        for path, expected in files.items():
+            self.assertEqual(remote[path], expected, f"CJK content mangled for {path}")
+
+    def test_large_text_file_round_trips_via_blob(self):
+        # Above MAX_INLINE_BYTES a text file must switch to a blob upload —
+        # lockfiles, bundles and source maps in real projects land here.
+        big = ("export const data = 'x';\n" * 60000).encode()
+        self.assertGreater(len(big), app.MAX_INLINE_BYTES)
+        files = {"src/generated/api-types.ts": big, "small.ts": b"export const a = 1;\n"}
+        result = self.deploy(build_zip(files))
+        self.assertEqual(result.blobs_uploaded, 1)   # only the big one
+        self.assertEqual(result.inlined, 1)
+        self.assertEqual(self.remote_files()["src/generated/api-types.ts"], big)
+
+
 class TestLocalHelpers(unittest.TestCase):
     def test_git_blob_sha_matches_git(self):
         # `printf 'hello' | git hash-object --stdin` -> b6fc4c62...

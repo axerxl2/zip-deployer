@@ -63,6 +63,11 @@ async function startMock() {
     throw new Error('mock server did not start');
 }
 
+async function remoteStats(owner, repo) {
+    const res = await fetch(`${MOCK_URL}/repos/${owner}/${repo}/_debug/stats`);
+    return res.json();
+}
+
 async function remoteFiles(owner, repo, branch = 'main') {
     const res = await fetch(`${MOCK_URL}/repos/${owner}/${repo}/_debug/files/${branch}`);
     const payload = await res.json();
@@ -253,7 +258,24 @@ async function main() {
         const pruned = await remoteFiles('octocat', 'prune');
         check(!pruned.has('drop.txt') && pruned.has('keep.txt'), 'prune deletes files missing from the ZIP');
 
-        // --- 6. SHA-1 fallback path -------------------------------------------
+        // --- 6. payload bounds with CJK content --------------------------------
+        console.log('\nbrowser: payload bounds with CJK/emoji content');
+        const cjkBody = '日本語のページ 🚀 Ünïcödé\n'.repeat(200);
+        const cjk = {};
+        for (let i = 0; i < 400; i++) cjk[`src/pages/page${String(i).padStart(4, '0')}.astro`] = Buffer.from(cjkBody + `// ${i}\n`, 'utf8');
+        await runDeploy({ zipBuffer: await buildZip(cjk), owner: 'octocat', repo: 'cjk' });
+        const cjkStats = await remoteStats('octocat', 'cjk');
+        const cjkFiles = await remoteFiles('octocat', 'cjk');
+        let cjkExact = true;
+        for (const [path, expected] of Object.entries(cjk)) {
+            const got = cjkFiles.get(path);
+            if (!got || !got.bytes.equals(expected)) cjkExact = false;
+        }
+        check(cjkExact, 'CJK/emoji content round-trips byte for byte');
+        check(cjkStats.max_request_bytes < 6 * 1024 * 1024,
+            `largest request body stays bounded (${(cjkStats.max_request_bytes / 1e6).toFixed(2)} MB)`);
+
+        // --- 7. SHA-1 fallback path -------------------------------------------
         console.log('\nbrowser: SHA-1 fallback (no crypto.subtle)');
         const run6 = await runDeploy({ zipBuffer: trickyZip, owner: 'octocat', repo: 'fallback', withSubtle: false });
         const fallbackFiles = await remoteFiles('octocat', 'fallback');

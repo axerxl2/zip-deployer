@@ -165,7 +165,8 @@
         // ------------------------------------------------------------------
         const CONFIG = {
             maxTreeEntries: 400,               // entries per POST /git/trees
-            maxTreeBytes: 4 * 1024 * 1024,     // payload budget per tree call
+            maxTreeBytes: 3 * 1024 * 1024,     // serialized payload budget per tree call
+            jsonEscapeHeadroom: 1.15,          // allowance for JSON escaping
             maxInlineBytes: 1024 * 1024,       // larger text files go via blob
             blobHardLimit: 100 * 1024 * 1024,  // GitHub's blob ceiling
             workers: 12,                       // parallel blob uploads
@@ -212,6 +213,13 @@
                     <div class="text-xs text-slate-500">${c.label}</div>
                 </div>`).join('');
             summaryBox.classList.remove('hidden');
+        }
+
+        // Byte length of a string once encoded as UTF-8 (str.length counts
+        // UTF-16 units, which undercounts CJK and emoji).
+        const utf8Encoder = new TextEncoder();
+        function utf8Length(text) {
+            return utf8Encoder.encode(text).length;
         }
 
         function humanBytes(n) {
@@ -537,7 +545,11 @@
             let current = [];
             let bytes = 0;
             for (const item of items) {
-                const cost = (item.content ? item.content.length : 0) + item.path.length + 64;
+                // Measure UTF-8 bytes, not string length: `.length` counts
+                // UTF-16 units, so CJK and emoji would be undercounted and the
+                // payload could come out far larger than the budget intends.
+                const contentBytes = item.content ? utf8Length(item.content) : 0;
+                const cost = Math.round(contentBytes * CONFIG.jsonEscapeHeadroom) + item.path.length + 96;
                 if (current.length && (current.length >= CONFIG.maxTreeEntries || bytes + cost > CONFIG.maxTreeBytes)) {
                     chunks.push(current);
                     current = [];

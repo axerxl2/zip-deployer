@@ -71,6 +71,46 @@ Two things worth reading twice:
 * The new engine's 3,000-file deploy was verified **byte for byte** (3000/3000) against
   locally computed git SHAs after the upload.
 
+### TypeScript / Astro projects
+
+Source-heavy repositories are the best case, because almost everything is text and
+therefore inlines. Benchmarked with `--profile astro`, whose fixture is generated to match
+a real Astro site's language breakdown (TypeScript 92.5%, CSS 4.9%, Astro 2.3%, other
+0.3%) and includes an oversized generated `.ts` bundle plus binary assets under `public/`:
+
+```
+scenario                                  files       time   requests     ok
+------------------------------------------------------------------------------
+New engine, first deploy                   3003      12.1s         32    yes
+New engine, no-op redeploy                 3003       2.0s          3    yes
+New engine, 1 file changed                 3003       4.5s          7    yes
+Original, rate limit ON (400 files)         400       6.0s        184     NO
+```
+
+**3,003 files in 12 seconds using 32 requests**, all verified byte-exact — only 16 files
+(the binary assets and the >1 MB bundle) needed a blob upload; the other 2,987 rode inline.
+
+Run it yourself:
+
+```bash
+python3 tests/benchmark.py --profile astro --files 3000
+```
+
+#### A unicode gotcha this shook out
+
+Python's `json.dumps` escapes non-ASCII by default, expanding every CJK character or emoji
+into a 6-byte `\uXXXX` sequence, and the chunker was sizing payloads by *character* count
+while UTF-8 spends 3–4 bytes on those same characters. On a Japanese or emoji-heavy repo
+both errors compound. Measured on 3.1 MB of CJK content:
+
+| | largest request body |
+|---|---|
+| before | 6.84 MB |
+| after (UTF-8 body, byte-accurate sizing) | **2.79 MB** |
+
+Both the Python and browser versions now send compact UTF-8 and budget chunks by real
+byte length. `tests/test_deploy.py` and `tests/test_browser.mjs` assert the bound.
+
 Numbers are latency-simulated rather than measured against github.com; what they capture
 is the shape of the work — how many round trips, and whether the rate limit is tripped —
 which is what governs real-world wall time.
@@ -193,10 +233,11 @@ flowchart TD
 Individually:
 
 ```bash
-python3 tests/test_deploy.py        # Python correctness (19 tests)
-node tests/test_browser.mjs         # browser end-to-end (needs: npm i --no-save jszip)
-python3 tests/benchmark.py          # head-to-head benchmark
-python3 tests/mock_github.py        # run the mock API standalone on :8080
+python3 tests/test_deploy.py               # Python correctness (21 tests)
+node tests/test_browser.mjs                # browser end-to-end (needs: npm i --no-save jszip)
+python3 tests/benchmark.py                 # head-to-head benchmark (generic web project)
+python3 tests/benchmark.py --profile astro # benchmark an Astro/TypeScript corpus
+python3 tests/mock_github.py               # run the mock API standalone on :8080
 ```
 
 [`tests/mock_github.py`](tests/mock_github.py) is a deliberately strict stand-in for
@@ -216,8 +257,13 @@ a stubbed DOM and `fetch` aimed at the mock, so the shipped code is what gets te
 
 Coverage includes byte-exact round trips for unicode, CRLF, empty files, files containing
 NUL bytes, binaries and executables; incremental redeploys; deduplication; pruning; path
-filtering; empty-repository bootstrap; flaky-API retries; and the SHA-1 fallback used when
+filtering; empty-repository bootstrap; flaky-API retries; request-payload bounds on
+CJK-heavy content; text files above the inline threshold; and the SHA-1 fallback used when
 `crypto.subtle` is unavailable.
+
+The optional benchmark dependencies (`requests`, `colorama` for running the original
+implementation, `jszip` for the browser tests) are skipped with a clear message when
+absent — the deployer itself needs none of them.
 
 ## Other language versions
 

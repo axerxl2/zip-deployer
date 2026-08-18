@@ -64,7 +64,8 @@ POINTS_WRITE = 5              # POST / PATCH / PUT / DELETE
 POINTS_READ = 1               # GET / HEAD / OPTIONS
 
 MAX_TREE_ENTRIES = 400        # entries per POST /git/trees call
-MAX_TREE_BYTES = 4 * 1024 * 1024   # raw payload budget per tree call
+MAX_TREE_BYTES = 3 * 1024 * 1024   # serialized payload budget per tree call
+JSON_ESCAPE_HEADROOM = 1.15   # allowance for JSON escaping of quotes/newlines
 MAX_INLINE_BYTES = 1024 * 1024     # bigger text files go the blob route
 BLOB_HARD_LIMIT = 100 * 1024 * 1024  # GitHub rejects blobs above ~100 MB
 
@@ -380,7 +381,10 @@ class GitHubClient:
 
     def request(self, method: str, path: str, data=None, allow_404: bool = False):
         url = f"{self.api_base}/repos/{self.owner}/{self.repo}{path}"
-        body = json.dumps(data).encode("utf-8") if data is not None else None
+        # ensure_ascii=False keeps non-ASCII as compact UTF-8 instead of
+        # expanding every character to a 6-byte \\uXXXX escape, which on a
+        # unicode-heavy repository inflates the payload by 1.5x or more.
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8") if data is not None else None
         points = POINTS_READ if method in ("GET", "HEAD", "OPTIONS") else POINTS_WRITE
 
         last_error = None
@@ -697,7 +701,13 @@ class Deployer:
         current: list[dict] = []
         current_bytes = 0
         for item in tree_items:
-            item_bytes = len(item.get("content", "")) + len(item["path"]) + 64
+            # Measure UTF-8 bytes, not characters: a CJK character is one
+            # character but three bytes, so counting characters would
+            # underestimate a Japanese or emoji-heavy payload threefold. The
+            # headroom covers JSON escaping of quotes, newlines and control
+            # characters.
+            content = item.get("content", "")
+            item_bytes = int(len(content.encode("utf-8")) * JSON_ESCAPE_HEADROOM) + len(item["path"]) + 96
             if current and (
                 len(current) >= MAX_TREE_ENTRIES or current_bytes + item_bytes > MAX_TREE_BYTES
             ):

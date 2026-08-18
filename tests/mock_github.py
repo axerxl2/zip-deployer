@@ -98,6 +98,14 @@ class Stats:
         self.total = 0
         self.max_concurrency = 0
         self.current = 0
+        # Largest request body seen. Packing many files per request is the
+        # whole optimisation, so it needs watching: an oversized payload is
+        # exactly how it would break against the real API.
+        self.max_request_bytes = 0
+
+    def record_body(self, size: int):
+        with self.lock:
+            self.max_request_bytes = max(self.max_request_bytes, size)
 
     def start(self, label: str):
         with self.lock:
@@ -185,6 +193,8 @@ class Handler(BaseHTTPRequestHandler):
         """
         length = int(self.headers.get("Content-Length") or 0)
         self._raw_body = self.rfile.read(length) if length else b""
+        if length:
+            self.backend.stats.record_body(length)
 
     def _send(self, status: int, payload, extra_headers: dict | None = None):
         data = json.dumps(payload).encode("utf-8") if payload is not None else b""
@@ -420,6 +430,16 @@ class Handler(BaseHTTPRequestHandler):
                 }
                 repo.refs[branch] = commit_sha
             self._send(201, {"content": {"path": path}, "commit": {"sha": commit_sha}})
+            return
+
+        # GET /_debug/stats  (test helper, not part of GitHub's API)
+        if method == "GET" and rest[:2] == ["_debug", "stats"]:
+            self._send(200, {
+                "requests": backend.stats.total,
+                "max_request_bytes": backend.stats.max_request_bytes,
+                "by_endpoint": backend.stats.by_endpoint,
+                "rate_limit_rejections": backend.limiter.rejections,
+            })
             return
 
         # GET /_debug/files/{branch}  (test helper, not part of GitHub's API)
