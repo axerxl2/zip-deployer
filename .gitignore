@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node (only needed to run the browser tests)
+node_modules/
+package-lock.json
+
+# Local artefacts
+*.zip

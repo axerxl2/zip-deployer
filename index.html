@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GitHub ZIP to Repo Uploader</title>
-  
+
   <link rel="icon" type="image/x-icon" href="https://raw.githubusercontent.com/iciiwhite/zip-deployer/main/favicon.ico">
 
 <meta property="og:title" content="GitHub ZIP Deployer">
@@ -30,6 +30,7 @@
         .log-window::-webkit-scrollbar-track { background: #1f2937; }
         .log-window::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
         .log-window::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+        .drop-active { border-color: #3b82f6 !important; background-color: #eff6ff !important; }
     </style>
 </head>
 <body class="bg-slate-50 min-h-screen font-sans text-slate-800 antialiased selection:bg-blue-200 p-4 sm:p-8">
@@ -40,6 +41,7 @@
             </div>
             <h1 class="text-3xl font-bold tracking-tight text-slate-900">GitHub ZIP Deployer</h1>
             <p class="text-slate-500">Unpack and push a ZIP file directly to your repository, right from the browser.</p>
+            <p class="text-xs text-slate-400">Batches thousands of files into a handful of API calls — 3,000 files in about a minute.</p>
         </header>
         <div class="bg-white rounded-3xl shadow-xl shadow-slate-200/50 border border-slate-100 overflow-hidden">
             <div class="p-6 sm:p-8 space-y-6">
@@ -50,9 +52,9 @@
                     </h2>
                     <div>
                         <label for="pat" class="block text-sm font-medium text-slate-700 mb-1">Personal Access Token (Classic or Fine-grained)</label>
-                        <input type="text" id="pat" placeholder="ghp_xxxxxxxxxxxxxxxxxxxx" 
+                        <input type="password" id="pat" placeholder="ghp_xxxxxxxxxxxxxxxxxxxx" autocomplete="off"
                             class="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors outline-none">
-                        <p class="text-xs text-slate-400 mt-1">Requires 'repo' scope. Your token never leaves your browser.</p>
+                        <p class="text-xs text-slate-400 mt-1">Requires 'repo' scope. Your token never leaves your browser and is never stored.</p>
                     </div>
                 </div>
                 <hr class="border-slate-100">
@@ -64,19 +66,49 @@
                     <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
                         <div>
                             <label for="owner" class="block text-sm font-medium text-slate-700 mb-1">Owner / Username</label>
-                            <input type="text" id="owner" placeholder="e.g., octocat" 
+                            <input type="text" id="owner" placeholder="e.g., octocat"
                                 class="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors outline-none">
                         </div>
                         <div>
                             <label for="repo" class="block text-sm font-medium text-slate-700 mb-1">Repository Name</label>
-                            <input type="text" id="repo" placeholder="e.g., hello-world" 
+                            <input type="text" id="repo" placeholder="e.g., hello-world"
                                 class="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors outline-none">
                         </div>
                         <div>
                             <label for="branch" class="block text-sm font-medium text-slate-700 mb-1">Branch</label>
-                            <input type="text" id="branch" value="main" 
+                            <input type="text" id="branch" value="main"
                                 class="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors outline-none">
                         </div>
+                    </div>
+                    <div>
+                        <label for="commit-message" class="block text-sm font-medium text-slate-700 mb-1">Commit message <span class="text-slate-400 font-normal">(optional)</span></label>
+                        <input type="text" id="commit-message" placeholder="Deploy from ZIP"
+                            class="w-full px-4 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors outline-none">
+                    </div>
+                </div>
+                <hr class="border-slate-100">
+                <div class="space-y-4">
+                    <h2 class="text-lg font-semibold flex items-center gap-2">
+                        <i data-lucide="sliders-horizontal" class="w-5 h-5 text-slate-400"></i>
+                        Options
+                    </h2>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input type="checkbox" id="opt-skip" checked class="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500">
+                            <span><span class="font-medium">Skip unchanged files</span><br><span class="text-slate-400 text-xs">Compares local git SHAs with the branch — makes re-deploys nearly instant.</span></span>
+                        </label>
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input type="checkbox" id="opt-verify" checked class="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500">
+                            <span><span class="font-medium">Verify after upload</span><br><span class="text-slate-400 text-xs">Re-reads the tree and checks every file byte for byte.</span></span>
+                        </label>
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input type="checkbox" id="opt-strip" class="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500">
+                            <span><span class="font-medium">Strip top-level folder</span><br><span class="text-slate-400 text-xs">Drops the wrapper directory many ZIPs add.</span></span>
+                        </label>
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input type="checkbox" id="opt-prune" class="mt-0.5 rounded border-slate-300 text-red-600 focus:ring-red-500">
+                            <span><span class="font-medium">Delete files missing from the ZIP</span><br><span class="text-slate-400 text-xs">Makes the branch mirror the archive exactly. Destructive.</span></span>
+                        </label>
                     </div>
                 </div>
                 <hr class="border-slate-100">
@@ -85,19 +117,29 @@
                         <i data-lucide="file-archive" class="w-5 h-5 text-slate-400"></i>
                         Project ZIP
                     </h2>
-                    <label for="zip-file" class="flex flex-col items-center justify-center w-full h-40 border-2 border-slate-300 border-dashed rounded-xl cursor-pointer bg-slate-50 hover:bg-slate-100 transition-colors group">
+                    <label id="drop-zone" for="zip-file" class="flex flex-col items-center justify-center w-full h-40 border-2 border-slate-300 border-dashed rounded-xl cursor-pointer bg-slate-50 hover:bg-slate-100 transition-colors group">
                         <div class="flex flex-col items-center justify-center pt-5 pb-6">
                             <i data-lucide="upload-cloud" class="w-10 h-10 text-slate-400 group-hover:text-blue-500 mb-3 transition-colors"></i>
                             <p class="mb-2 text-sm text-slate-600"><span class="font-semibold text-blue-600">Click to upload</span> or drag and drop</p>
                             <p class="text-xs text-slate-500" id="file-name-display">.ZIP files only</p>
                         </div>
-                        <input id="zip-file" type="file" accept=".zip" class="hidden" />
+                        <input id="zip-file" type="file" accept=".zip,application/zip" class="hidden" />
                     </label>
                 </div>
                 <button id="upload-btn" class="w-full py-3 px-4 bg-slate-900 hover:bg-slate-800 text-white font-medium rounded-xl shadow-lg shadow-slate-900/20 transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
                     <i data-lucide="rocket" class="w-5 h-5"></i>
                     <span>Deploy to GitHub</span>
                 </button>
+                <div id="progress-wrap" class="hidden space-y-2">
+                    <div class="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
+                        <div id="progress-bar" class="bg-blue-600 h-2 rounded-full transition-all duration-200" style="width: 0%"></div>
+                    </div>
+                    <div class="flex justify-between text-xs text-slate-500">
+                        <span id="progress-label">Preparing...</span>
+                        <span id="progress-stats"></span>
+                    </div>
+                </div>
+                <div id="summary" class="hidden grid grid-cols-2 sm:grid-cols-4 gap-3 text-center"></div>
             </div>
             <div class="bg-slate-900 p-6 text-slate-300 font-mono text-sm">
                 <div class="flex items-center gap-2 mb-3 text-slate-500">
@@ -107,152 +149,643 @@
                 <div id="log" class="log-window h-48 overflow-y-auto whitespace-pre-wrap break-all leading-relaxed">System ready. Waiting for task...</div>
             </div>
         </div>
+        <p class="text-center text-xs text-slate-400">
+            Uses GitHub's Git Data API. Text files ride inline inside tree objects, so thousands of
+            files cost a handful of requests instead of one request each.
+        </p>
     </main>
     <script>
+    (function () {
+        'use strict';
+
         lucide.createIcons();
-        const fileInput = document.getElementById('zip-file');
-        const fileNameDisplay = document.getElementById('file-name-display');
-        const uploadBtn = document.getElementById('upload-btn');
-        const logWindow = document.getElementById('log');
-        const inputs = {
-            pat: document.getElementById('pat'),
-            owner: document.getElementById('owner'),
-            repo: document.getElementById('repo'),
-            branch: document.getElementById('branch')
+
+        // ------------------------------------------------------------------
+        // Tuning — mirrors app.py
+        // ------------------------------------------------------------------
+        const CONFIG = {
+            maxTreeEntries: 400,               // entries per POST /git/trees
+            maxTreeBytes: 4 * 1024 * 1024,     // payload budget per tree call
+            maxInlineBytes: 1024 * 1024,       // larger text files go via blob
+            blobHardLimit: 100 * 1024 * 1024,  // GitHub's blob ceiling
+            workers: 12,                       // parallel blob uploads
+            pointsPerMin: 900,                 // GitHub's secondary rate limit
+            safety: 0.85,                      // margin for client/server clock skew
+            maxRetries: 6
         };
-        fileInput.addEventListener('change', (e) => {
-            if (e.target.files.length > 0) {
-                const file = e.target.files[0];
-                fileNameDisplay.innerHTML = `<span class="text-blue-600 font-semibold">${file.name}</span> (${(file.size / 1024 / 1024).toFixed(2)} MB)`;
-            } else {
-                fileNameDisplay.textContent = '.ZIP files only';
-            }
-        });
-        function log(message, type = 'info') {
+        const SKIP_PATTERNS = ['__MACOSX', '.DS_Store', 'Thumbs.db'];
+
+        const el = (id) => document.getElementById(id);
+        const fileInput = el('zip-file');
+        const dropZone = el('drop-zone');
+        const fileNameDisplay = el('file-name-display');
+        const uploadBtn = el('upload-btn');
+        const logWindow = el('log');
+        const progressWrap = el('progress-wrap');
+        const progressBar = el('progress-bar');
+        const progressLabel = el('progress-label');
+        const progressStats = el('progress-stats');
+        const summaryBox = el('summary');
+
+        // ------------------------------------------------------------------
+        // UI helpers
+        // ------------------------------------------------------------------
+        function log(message, type) {
             const time = new Date().toLocaleTimeString();
-            let color = 'text-slate-300';
-            if (type === 'error') color = 'text-red-400';
-            if (type === 'success') color = 'text-emerald-400';
-            if (type === 'warn') color = 'text-yellow-400';
-            logWindow.innerHTML += `\n<span class="text-slate-500">[${time}]</span> <span class="${color}">${message}</span>`;
+            const color = { error: 'text-red-400', success: 'text-emerald-400', warn: 'text-yellow-400' }[type] || 'text-slate-300';
+            const safe = String(message).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+            logWindow.innerHTML += `\n<span class="text-slate-500">[${time}]</span> <span class="${color}">${safe}</span>`;
             logWindow.scrollTop = logWindow.scrollHeight;
         }
+
+        function setProgress(fraction, label, stats) {
+            progressWrap.classList.remove('hidden');
+            progressBar.style.width = `${Math.max(0, Math.min(1, fraction)) * 100}%`;
+            if (label !== undefined) progressLabel.textContent = label;
+            if (stats !== undefined) progressStats.textContent = stats;
+        }
+
+        function showSummary(cards) {
+            summaryBox.innerHTML = cards.map((c) => `
+                <div class="bg-slate-50 border border-slate-100 rounded-xl py-3">
+                    <div class="text-xl font-semibold text-slate-900">${c.value}</div>
+                    <div class="text-xs text-slate-500">${c.label}</div>
+                </div>`).join('');
+            summaryBox.classList.remove('hidden');
+        }
+
+        function humanBytes(n) {
+            if (n < 1024) return `${n} B`;
+            if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+            return `${(n / 1024 / 1024).toFixed(1)} MB`;
+        }
+
+        function humanDuration(ms) {
+            const s = ms / 1000;
+            if (s < 90) return `${s.toFixed(1)}s`;
+            return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+        }
+
+        // ------------------------------------------------------------------
+        // git SHA-1 (so we can tell locally what the server already has)
+        // ------------------------------------------------------------------
+        function sha1Fallback(bytes) {
+            // Minimal SHA-1 for contexts where crypto.subtle is unavailable
+            // (for example a page opened over file:// in some browsers).
+            const ml = bytes.length;
+            const withPad = new Uint8Array((((ml + 8) >> 6) + 1) << 6);
+            withPad.set(bytes);
+            withPad[ml] = 0x80;
+            const view = new DataView(withPad.buffer);
+            view.setUint32(withPad.length - 4, ml << 3, false);
+            view.setUint32(withPad.length - 8, Math.floor(ml / 536870912), false);
+            let h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
+            const w = new Int32Array(80);
+            for (let i = 0; i < withPad.length; i += 64) {
+                for (let j = 0; j < 16; j++) w[j] = view.getInt32(i + j * 4, false);
+                for (let j = 16; j < 80; j++) {
+                    const n = w[j - 3] ^ w[j - 8] ^ w[j - 14] ^ w[j - 16];
+                    w[j] = (n << 1) | (n >>> 31);
+                }
+                let a = h0, b = h1, c = h2, d = h3, e = h4;
+                for (let j = 0; j < 80; j++) {
+                    let f, k;
+                    if (j < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+                    else if (j < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+                    else if (j < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+                    else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+                    const t = (((a << 5) | (a >>> 27)) + f + e + k + w[j]) | 0;
+                    e = d; d = c; c = (b << 30) | (b >>> 2); b = a; a = t;
+                }
+                h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0; h4 = (h4 + e) | 0;
+            }
+            return [h0, h1, h2, h3, h4].map((n) => (n >>> 0).toString(16).padStart(8, '0')).join('');
+        }
+
+        const hasSubtle = typeof crypto !== 'undefined' && crypto.subtle && crypto.subtle.digest;
+
+        async function gitBlobSha(bytes) {
+            // git hashes "blob <length>\0" followed by the raw content.
+            const header = new TextEncoder().encode(`blob ${bytes.length}\0`);
+            const buffer = new Uint8Array(header.length + bytes.length);
+            buffer.set(header, 0);
+            buffer.set(bytes, header.length);
+            if (hasSubtle) {
+                const digest = await crypto.subtle.digest('SHA-1', buffer);
+                return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+            }
+            return sha1Fallback(buffer);
+        }
+
+        // ------------------------------------------------------------------
+        // Content classification and encoding
+        // ------------------------------------------------------------------
+        const strictDecoder = new TextDecoder('utf-8', { fatal: true });
+
+        function decodeIfText(bytes) {
+            if (bytes.length > CONFIG.maxInlineBytes) return null;
+            for (let i = 0; i < bytes.length; i++) if (bytes[i] === 0) return null;
+            try {
+                return strictDecoder.decode(bytes);
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function toBase64(bytes) {
+            let binary = '';
+            const chunk = 0x8000;
+            for (let i = 0; i < bytes.length; i += chunk) {
+                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+            }
+            return btoa(binary);
+        }
+
+        function normalizePath(raw) {
+            let path = raw.replace(/\\/g, '/').replace(/^\/+/, '');
+            while (path.startsWith('./')) path = path.slice(2);
+            const parts = path.split('/').filter((p) => p !== '' && p !== '.');
+            if (parts.some((p) => p === '..' || p === '.git')) return null;
+            path = parts.join('/');
+            if (!path) return null;
+            if (SKIP_PATTERNS.some((pattern) => path.includes(pattern))) return null;
+            return path;
+        }
+
+        // ------------------------------------------------------------------
+        // Rate limiting: stay under 900 points/min (POST costs 5, GET costs 1)
+        // ------------------------------------------------------------------
+        class PointBudget {
+            constructor(pointsPerMin) {
+                this.limit = Math.max(Math.floor(pointsPerMin * CONFIG.safety), 10);
+                this.events = [];
+                this.spent = 0;
+                this.chain = Promise.resolve();
+            }
+            spend(points) {
+                // Serialised so concurrent uploads cannot race past the budget.
+                this.chain = this.chain.then(async () => {
+                    for (;;) {
+                        const now = Date.now();
+                        while (this.events.length && now - this.events[0][0] >= 60000) {
+                            this.spent -= this.events.shift()[1];
+                        }
+                        if (this.spent + points <= this.limit) {
+                            this.events.push([now, points]);
+                            this.spent += points;
+                            return;
+                        }
+                        const wait = 60000 - (now - this.events[0][0]) + 20;
+                        await sleep(Math.min(wait, 5000));
+                    }
+                });
+                return this.chain;
+            }
+        }
+
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+        // ------------------------------------------------------------------
+        // GitHub client
+        // ------------------------------------------------------------------
+        class GitHub {
+            constructor(token, owner, repo) {
+                this.token = token;
+                this.owner = owner;
+                this.repo = repo;
+                this.budget = new PointBudget(CONFIG.pointsPerMin);
+                this.requests = 0;
+            }
+
+            async call(path, method = 'GET', body = null, options = {}) {
+                const url = `https://api.github.com/repos/${this.owner}/${this.repo}${path}`;
+                const points = method === 'GET' ? 1 : 5;
+                let lastError = null;
+
+                for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
+                    await this.budget.spend(points);
+                    let res;
+                    try {
+                        res = await fetch(url, {
+                            method,
+                            headers: {
+                                Authorization: `Bearer ${this.token}`,
+                                Accept: 'application/vnd.github+json',
+                                'X-GitHub-Api-Version': '2022-11-28',
+                                'Content-Type': 'application/json'
+                            },
+                            body: body ? JSON.stringify(body) : null
+                        });
+                    } catch (networkError) {
+                        lastError = networkError;
+                        if (attempt === CONFIG.maxRetries) throw networkError;
+                        await sleep(backoffMs(attempt));
+                        continue;
+                    }
+
+                    this.requests++;
+                    if (res.status === 204) return null;
+                    if (res.ok) return res.json();
+                    if (res.status === 404 && options.allow404) return null;
+
+                    const text = await res.text();
+                    let message = text;
+                    try { message = (JSON.parse(text).message) || text; } catch (e) { /* keep raw */ }
+
+                    const retryable = res.status === 429 || res.status >= 500 ||
+                        (res.status === 403 && /rate limit|abuse/i.test(message));
+                    if (!retryable || attempt === CONFIG.maxRetries) {
+                        throw new Error(`GitHub API ${res.status} on ${path}: ${message}`);
+                    }
+
+                    const retryAfter = parseFloat(res.headers.get('retry-after'));
+                    const delay = Number.isFinite(retryAfter)
+                        ? Math.min(retryAfter * 1000 + 1000, 120000)
+                        : backoffMs(attempt);
+                    log(`${res.status} on ${path} — retrying in ${(delay / 1000).toFixed(1)}s`, 'warn');
+                    await sleep(delay);
+                }
+                throw lastError || new Error(`Request failed: ${path}`);
+            }
+        }
+
+        function backoffMs(attempt) {
+            return Math.min(Math.pow(2, attempt) * 1000, 30000) * (0.5 + Math.random() / 2);
+        }
+
+        async function runPool(items, limit, worker) {
+            let index = 0;
+            const size = Math.min(limit, items.length);
+            const runners = [];
+            for (let i = 0; i < size; i++) {
+                runners.push((async () => {
+                    for (;;) {
+                        const current = index++;
+                        if (current >= items.length) return;
+                        await worker(items[current], current);
+                    }
+                })());
+            }
+            await Promise.all(runners);
+        }
+
+        // ------------------------------------------------------------------
+        // Deployment
+        // ------------------------------------------------------------------
+        async function readArchive(file, stripRoot) {
+            const zip = await JSZip.loadAsync(file);
+            const entries = [];
+            zip.forEach((relativePath, zipEntry) => {
+                if (zipEntry.dir) return;
+                const path = normalizePath(relativePath);
+                if (path) entries.push({ path, entry: zipEntry });
+            });
+            if (!entries.length) return [];
+
+            if (stripRoot) {
+                const roots = new Set(entries.map((e) => e.path.split('/')[0]));
+                if (roots.size === 1 && entries.some((e) => e.path.includes('/'))) {
+                    const root = [...roots][0] + '/';
+                    const stripped = entries
+                        .map((e) => ({ ...e, path: e.path.startsWith(root) ? e.path.slice(root.length) : e.path }))
+                        .filter((e) => e.path);
+                    if (stripped.length) {
+                        log(`Stripped common root folder '${root}' from ${stripped.length} paths`);
+                        return readContents(stripped);
+                    }
+                }
+            }
+            return readContents(entries);
+        }
+
+        async function readContents(entries) {
+            const files = [];
+            let done = 0;
+            // JSZip inflates one entry at a time; a small pool keeps the UI live.
+            await runPool(entries, 8, async (item) => {
+                const data = await item.entry.async('uint8array');
+                files.push({
+                    path: item.path,
+                    data,
+                    size: data.length,
+                    sha: await gitBlobSha(data),
+                    mode: (item.entry.unixPermissions && (item.entry.unixPermissions & 0o111)) ? '100755' : '100644'
+                });
+                done++;
+                if (done % 100 === 0 || done === entries.length) {
+                    setProgress(done / entries.length, 'Reading and hashing archive...', `${done} / ${entries.length}`);
+                }
+            });
+            files.sort((a, b) => (a.path < b.path ? -1 : 1));
+            return files;
+        }
+
+        async function resolveBranch(gh, branch) {
+            const ref = await gh.call(`/git/ref/heads/${branch}`, 'GET', null, { allow404: true });
+            if (ref) {
+                const commit = await gh.call(`/git/commits/${ref.object.sha}`);
+                return { commitSha: ref.object.sha, treeSha: commit.tree.sha };
+            }
+            log(`Branch '${branch}' not found — initializing repository...`, 'warn');
+            await gh.call('/contents/README.md', 'PUT', {
+                message: 'Initial commit by GitHub ZIP Deployer',
+                content: btoa('# Project Repository\n\nInitialized automatically by GitHub ZIP Deployer.\n'),
+                branch
+            });
+            log('Repository initialized with README.md', 'success');
+            const created = await gh.call(`/git/ref/heads/${branch}`);
+            const commit = await gh.call(`/git/commits/${created.object.sha}`);
+            return { commitSha: created.object.sha, treeSha: commit.tree.sha };
+        }
+
+        async function fetchExistingTree(gh, treeSha) {
+            const data = await gh.call(`/git/trees/${treeSha}?recursive=1`, 'GET', null, { allow404: true });
+            const byPath = new Map();
+            const shas = new Set();
+            if (data && data.tree) {
+                for (const item of data.tree) {
+                    if (item.type === 'blob') {
+                        byPath.set(item.path, item.sha);
+                        shas.add(item.sha);
+                    }
+                }
+            }
+            return { byPath, shas, truncated: Boolean(data && data.truncated) };
+        }
+
+        async function uploadBlobs(gh, files, onProgress) {
+            const unique = new Map();
+            for (const file of files) if (!unique.has(file.sha)) unique.set(file.sha, file);
+            const todo = [...unique.values()];
+            let done = 0;
+            await runPool(todo, CONFIG.workers, async (file) => {
+                const blob = await gh.call('/git/blobs', 'POST', {
+                    content: toBase64(file.data),
+                    encoding: 'base64'
+                });
+                if (blob.sha !== file.sha) {
+                    log(`Blob SHA mismatch for ${file.path}`, 'warn');
+                }
+                done++;
+                onProgress(done, todo.length);
+            });
+            return todo.length;
+        }
+
+        async function buildTree(gh, items, baseTree, onProgress) {
+            const chunks = [];
+            let current = [];
+            let bytes = 0;
+            for (const item of items) {
+                const cost = (item.content ? item.content.length : 0) + item.path.length + 64;
+                if (current.length && (current.length >= CONFIG.maxTreeEntries || bytes + cost > CONFIG.maxTreeBytes)) {
+                    chunks.push(current);
+                    current = [];
+                    bytes = 0;
+                }
+                current.push(item);
+                bytes += cost;
+            }
+            if (current.length) chunks.push(current);
+
+            let treeSha = baseTree;
+            for (let i = 0; i < chunks.length; i++) {
+                const payload = { tree: chunks[i] };
+                if (treeSha) payload.base_tree = treeSha;
+                const response = await gh.call('/git/trees', 'POST', payload);
+                treeSha = response.sha;
+                onProgress(i + 1, chunks.length);
+            }
+            return { treeSha, calls: chunks.length };
+        }
+
+        async function verifyTree(gh, treeSha, expected) {
+            const data = await gh.call(`/git/trees/${treeSha}?recursive=1`);
+            if (data.truncated) {
+                log('Tree too large to verify in one read — skipping deep verification.', 'warn');
+                return [];
+            }
+            const actual = new Map();
+            for (const item of data.tree) if (item.type === 'blob') actual.set(item.path, item.sha);
+            const bad = [];
+            expected.forEach((sha, path) => { if (actual.get(path) !== sha) bad.push(path); });
+            return bad;
+        }
+
+        async function deploy(options) {
+            const { token, owner, repo, branch, file, message, skipUnchanged, verify, prune, stripRoot } = options;
+            const started = Date.now();
+            const gh = new GitHub(token, owner, repo);
+
+            log('Reading ZIP file in memory...');
+            const files = await readArchive(file, stripRoot);
+            if (!files.length) throw new Error('No deployable files found in the archive.');
+            const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+            log(`Found ${files.length} file(s), ${humanBytes(totalBytes)} uncompressed.`);
+            if (!hasSubtle) log('crypto.subtle unavailable — using the built-in SHA-1 implementation.', 'warn');
+
+            const tooBig = files.filter((f) => f.size > CONFIG.blobHardLimit);
+            if (tooBig.length) throw new Error(`Exceeds GitHub's 100 MB blob limit: ${tooBig[0].path}`);
+
+            setProgress(0.05, `Resolving branch '${branch}'...`);
+            const { commitSha, treeSha } = await resolveBranch(gh, branch);
+
+            setProgress(0.1, 'Comparing against the existing tree...');
+            const existing = skipUnchanged
+                ? await fetchExistingTree(gh, treeSha)
+                : { byPath: new Map(), shas: new Set(), truncated: false };
+            if (existing.truncated) log('Existing tree listing truncated; some files may be re-sent.', 'warn');
+
+            const changed = files.filter((f) => existing.byPath.get(f.path) !== f.sha);
+            const unchanged = files.length - changed.length;
+            if (unchanged) log(`${unchanged} file(s) already identical on '${branch}' — skipping.`);
+
+            const deletions = [];
+            if (prune) {
+                const incoming = new Set(files.map((f) => f.path));
+                existing.byPath.forEach((_sha, path) => {
+                    if (!incoming.has(path)) deletions.push({ path, mode: '100644', type: 'blob', sha: null });
+                });
+                if (deletions.length) log(`Prune: ${deletions.length} path(s) will be deleted.`, 'warn');
+            }
+
+            if (!changed.length && !deletions.length) {
+                log('Nothing to do — the branch already matches this ZIP.', 'success');
+                setProgress(1, 'Already up to date', '');
+                return { files: files.length, unchanged, inlined: 0, uploaded: 0, requests: gh.requests,
+                         duration: Date.now() - started, noChanges: true };
+            }
+
+            // Split the work: inline whatever is valid UTF-8, blob the rest.
+            const inline = [];
+            const viaBlob = [];
+            let reused = 0;
+            for (const file of changed) {
+                if (existing.shas.has(file.sha)) { viaBlob.push(file); reused++; continue; }
+                const text = decodeIfText(file.data);
+                if (text !== null) { file.text = text; inline.push(file); }
+                else viaBlob.push(file);
+            }
+            const needsUpload = viaBlob.filter((f) => !existing.shas.has(f.sha));
+            log(`Plan: ${inline.length} inlined into tree, ${needsUpload.length} uploaded as blobs, ` +
+                `${reused} reused, ${unchanged} unchanged.`);
+
+            if (needsUpload.length) {
+                setProgress(0.15, 'Uploading binary files...', `0 / ${needsUpload.length}`);
+                await uploadBlobs(gh, needsUpload, (done, total) => {
+                    setProgress(0.15 + 0.35 * (done / total), 'Uploading binary files...', `${done} / ${total}`);
+                });
+                log(`Uploaded ${needsUpload.length} blob(s).`);
+            }
+
+            const treeItems = inline.map((f) => ({ path: f.path, mode: f.mode, type: 'blob', content: f.text }))
+                .concat(viaBlob.map((f) => ({ path: f.path, mode: f.mode, type: 'blob', sha: f.sha })))
+                .concat(deletions);
+
+            setProgress(0.5, 'Writing the git tree...', '');
+            const { treeSha: newTree, calls } = await buildTree(gh, treeItems, treeSha, (done, total) => {
+                setProgress(0.5 + 0.35 * (done / total), 'Writing the git tree...', `${done} / ${total} requests`);
+            });
+            log(`Tree written in ${calls} request(s).`);
+
+            let finalTree = newTree;
+            if (verify) {
+                setProgress(0.88, 'Verifying uploaded content...');
+                const expected = new Map(changed.map((f) => [f.path, f.sha]));
+                let bad = await verifyTree(gh, finalTree, expected);
+                if (bad.length) {
+                    log(`${bad.length} entr(ies) did not match — repairing via blob upload.`, 'warn');
+                    const byPath = new Map(changed.map((f) => [f.path, f]));
+                    const repair = bad.map((p) => byPath.get(p)).filter(Boolean);
+                    await uploadBlobs(gh, repair, () => {});
+                    const repaired = await buildTree(gh,
+                        repair.map((f) => ({ path: f.path, mode: f.mode, type: 'blob', sha: f.sha })),
+                        finalTree, () => {});
+                    finalTree = repaired.treeSha;
+                    bad = await verifyTree(gh, finalTree, expected);
+                    if (bad.length) throw new Error(`Verification failed for ${bad.length} file(s), e.g. ${bad[0]}`);
+                }
+                log('Verification passed — every file matches byte for byte.', 'success');
+            }
+
+            setProgress(0.93, 'Creating commit...');
+            const commitMessage = message || `Deploy ${changed.length} file(s) from ZIP\n\n` +
+                `${inline.length} inlined, ${needsUpload.length} uploaded, ${unchanged} unchanged.`;
+            const commit = await gh.call('/git/commits', 'POST', {
+                message: commitMessage,
+                tree: finalTree,
+                parents: [commitSha]
+            });
+
+            setProgress(0.98, 'Updating branch reference...');
+            await gh.call(`/git/refs/heads/${branch}`, 'PATCH', { sha: commit.sha, force: false });
+            setProgress(1, 'Done', '');
+
+            return {
+                files: files.length,
+                unchanged,
+                inlined: inline.length,
+                uploaded: needsUpload.length,
+                requests: gh.requests,
+                duration: Date.now() - started,
+                commit: commit.sha,
+                noChanges: false
+            };
+        }
+
+        // ------------------------------------------------------------------
+        // Wiring
+        // ------------------------------------------------------------------
+        function describeFile(file) {
+            fileNameDisplay.innerHTML = `<span class="text-blue-600 font-semibold">${file.name}</span> (${humanBytes(file.size)})`;
+        }
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length) describeFile(e.target.files[0]);
+            else fileNameDisplay.textContent = '.ZIP files only';
+        });
+
+        ['dragenter', 'dragover'].forEach((name) => dropZone.addEventListener(name, (e) => {
+            e.preventDefault();
+            dropZone.classList.add('drop-active');
+        }));
+        ['dragleave', 'drop'].forEach((name) => dropZone.addEventListener(name, (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('drop-active');
+        }));
+        dropZone.addEventListener('drop', (e) => {
+            const dropped = e.dataTransfer.files;
+            if (dropped && dropped.length) {
+                fileInput.files = dropped;
+                describeFile(dropped[0]);
+            }
+        });
+
+        // Remember the target repo (never the token) between visits.
+        ['owner', 'repo', 'branch'].forEach((key) => {
+            const input = el(key);
+            try {
+                const saved = localStorage.getItem(`zipdeployer.${key}`);
+                if (saved) input.value = saved;
+            } catch (e) { /* storage may be blocked */ }
+            input.addEventListener('change', () => {
+                try { localStorage.setItem(`zipdeployer.${key}`, input.value.trim()); } catch (e) {}
+            });
+        });
+
         uploadBtn.addEventListener('click', async () => {
-            const token = inputs.pat.value.trim();
-            const owner = inputs.owner.value.trim();
-            const repo = inputs.repo.value.trim();
-            const branch = inputs.branch.value.trim() || 'main';
+            const token = el('pat').value.trim();
+            const owner = el('owner').value.trim();
+            const repo = el('repo').value.trim();
+            const branch = el('branch').value.trim() || 'main';
             const file = fileInput.files[0];
+
             if (!token || !owner || !repo || !file) {
-                alert("Please fill in all required fields and select a ZIP file.");
+                alert('Please fill in all required fields and select a ZIP file.');
                 return;
             }
+
             uploadBtn.disabled = true;
-            uploadBtn.innerHTML = `<i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> Processing...`;
+            uploadBtn.innerHTML = '<i data-lucide="loader-2" class="w-5 h-5 animate-spin"></i> Deploying...';
             lucide.createIcons();
-            log('\n--- Starting New Deployment ---', 'info');
-            const api = async (path, method = 'GET', body = null) => {
-                const res = await fetch(`https://api.github.com/repos/${owner}/${repo}${path}`, {
-                    method,
-                    headers: {
-                        'Authorization': `Bearer ${token}`,
-                        'Accept': 'application/vnd.github.v3+json',
-                        'Content-Type': 'application/json'
-                    },
-                    body: body ? JSON.stringify(body) : null
-                });
-                if (!res.ok) {
-                    const errText = await res.text();
-                    throw new Error(`API Error (${res.status}): ${errText}`);
-                }
-                if (res.status === 204) return null;
-                return res.json();
-            };
+            summaryBox.classList.add('hidden');
+            log('\n--- Starting New Deployment ---');
+
             try {
-                log('Reading ZIP file in memory...');
-                const zip = await JSZip.loadAsync(file);
-                const filesToUpload = [];
-                zip.forEach((relativePath, zipEntry) => {
-                    if (!zipEntry.dir && !relativePath.includes('__MACOSX') && !relativePath.includes('.DS_Store')) {
-                        filesToUpload.push({ path: relativePath, entry: zipEntry });
-                    }
+                const result = await deploy({
+                    token, owner, repo, branch, file,
+                    message: el('commit-message').value.trim(),
+                    skipUnchanged: el('opt-skip').checked,
+                    verify: el('opt-verify').checked,
+                    prune: el('opt-prune').checked,
+                    stripRoot: el('opt-strip').checked
                 });
-                log(`Found ${filesToUpload.length} valid files to process.`);
-                let latestCommitSha, baseTreeSha;
-                try {
-                    log(`Fetching branch '${branch}' details...`);
-                    const ref = await api(`/git/ref/heads/${branch}`);
-                    latestCommitSha = ref.object.sha;
-                    const latestCommit = await api(`/git/commits/${latestCommitSha}`);
-                    baseTreeSha = latestCommit.tree.sha;
-                } catch (e) {
-                    log(`Branch '${branch}' not found or repository empty. Attempting initialization...`, 'warn');
-                    try {
-                        await api(`/contents/README.md`, 'PUT', {
-                            message: "Initial commit by GitHub ZIP Deployer",
-                            content: btoa("# Project Repository\nInitialized automatically."),
-                            branch: branch
-                        });
-                        log('Successfully initialized repository with README.md', 'success');
-                        const ref = await api(`/git/ref/heads/${branch}`);
-                        latestCommitSha = ref.object.sha;
-                        const latestCommit = await api(`/git/commits/${latestCommitSha}`);
-                        baseTreeSha = latestCommit.tree.sha;
-                    } catch (initErr) {
-                        throw new Error(`Failed to initialize empty repository: ${initErr.message}`);
-                    }
+
+                const rate = result.files / (result.duration / 1000);
+                if (result.noChanges) {
+                    log(`Branch '${branch}' is already up to date (${result.unchanged} files).`, 'success');
+                } else {
+                    log(`Deployed ${result.files} file(s) in ${humanDuration(result.duration)} ` +
+                        `(${rate.toFixed(0)} files/s) using ${result.requests} API requests.`, 'success');
+                    log(`https://github.com/${owner}/${repo}/tree/${branch}`, 'success');
                 }
-                log(`Uploading files as blobs...`);
-                const tree = [];
-                const batchSize = 10;
-                for (let i = 0; i < filesToUpload.length; i += batchSize) {
-                    const batch = filesToUpload.slice(i, i + batchSize);
-                    const uploadPromises = batch.map(async (fileObj) => {
-                        const content = await fileObj.entry.async("base64");
-                        const blob = await api('/git/blobs', 'POST', { 
-                            content: content, 
-                            encoding: 'base64' 
-                        });
-                        return {
-                            path: fileObj.path,
-                            mode: '100644',
-                            type: 'blob',
-                            sha: blob.sha
-                        };
-                    });
-                    const results = await Promise.all(uploadPromises);
-                    tree.push(...results);
-                    const processed = Math.min(i + batchSize, filesToUpload.length);
-                    log(`  -> Uploaded ${processed} / ${filesToUpload.length} files...`);
-                }
-                log('Constructing new Git tree...');
-                const newTree = await api('/git/trees', 'POST', {
-                    base_tree: baseTreeSha,
-                    tree: tree
-                });
-                log('Creating commit...');
-                const newCommit = await api('/git/commits', 'POST', {
-                    message: `Upload ZIP deployment via Web Client\n\nUploaded ${filesToUpload.length} files.`,
-                    tree: newTree.sha,
-                    parents: [latestCommitSha]
-                });
-                log('Updating branch reference to new commit...');
-                await api(`/git/refs/heads/${branch}`, 'PATCH', {
-                    sha: newCommit.sha,
-                    force: false
-                });
-                log(`Successfully deployed ${filesToUpload.length} files to ${owner}/${repo} on branch '${branch}'! 🎉`, 'success');
-                fileInput.value = '';
-                fileNameDisplay.textContent = '.ZIP files only';
+                showSummary([
+                    { value: result.files, label: 'files' },
+                    { value: result.requests, label: 'API requests' },
+                    { value: humanDuration(result.duration), label: 'elapsed' },
+                    { value: result.unchanged, label: 'unchanged' }
+                ]);
             } catch (error) {
                 log(`Deployment failed: ${error.message}`, 'error');
+                setProgress(0, 'Failed', '');
                 console.error(error);
             } finally {
                 uploadBtn.disabled = false;
-                uploadBtn.innerHTML = `<i data-lucide="rocket" class="w-5 h-5"></i><span>Deploy to GitHub</span>`;
+                uploadBtn.innerHTML = '<i data-lucide="rocket" class="w-5 h-5"></i><span>Deploy to GitHub</span>';
                 lucide.createIcons();
             }
         });
+    })();
     </script>
 </body>
 </html>

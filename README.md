@@ -1,8 +1,8 @@
 # GitHub ZIP Deployer
 
-[![Python](https://img.shields.io/badge/Python-3.6+-blue.svg)](app.py)
+[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](app.py)
 [![Go](https://img.shields.io/badge/Go-1.16+-00ADD8.svg)](app.go)
-[![C++](https://img.shields.io/badge/C++-17-blue.svg)](app.cxx)
+[![C++](https://img.shields.io/badge/C++-17-blue.svg)](app.cpp)
 [![Erlang](https://img.shields.io/badge/Erlang-22+-red.svg)](app.erl)
 [![Ruby](https://img.shields.io/badge/Ruby-2.7+-red.svg)](app.rb)
 [![PHP](https://img.shields.io/badge/PHP-7.4+-777BB4.svg)](index.php)
@@ -12,248 +12,266 @@
 [![Haskell](https://img.shields.io/badge/Haskell-9.0+-5e5086.svg)](app.hs)
 [![Forth](https://img.shields.io/badge/Forth-Gforth-000000.svg)](app.fs)
 
-A collection of command-line tools that extract a ZIP archive and push its contents directly to a GitHub repository using the GitHub API. Available in 11 programming languages plus a browser-based version.
+Extract a ZIP archive and push its contents straight to a GitHub repository through
+the GitHub API — no clone, no git binary, one commit.
 
-## Overview
+**3,000 files deploy in about 75 seconds using ~210 API requests.**
 
-```mermaid
-flowchart TD
-    A[Start] --> B[Input token, owner, repo, branch, ZIP path]
-    B --> C{Read ZIP file}
-    C --> D[Extract files, filter __MACOSX & .DS_Store]
-    D --> E[Fetch branch reference]
-    E --> F{Branch exists?}
-    F -->|Yes| G[Get latest commit SHA and tree SHA]
-    F -->|No / empty repo| H[Initialize repo with README commit]
-    H --> G
-    G --> I[Batch files into groups of 10]
-    I --> J[Upload each file as Git blob via API]
-    J --> K[Collect blob SHAs]
-    K --> L{More files?}
-    L -->|Yes| I
-    L -->|No| M[Create new Git tree from base tree + blobs]
-    M --> N[Create commit with new tree, parent = latest commit]
-    N --> O[Update branch reference to new commit SHA]
-    O --> P[Success: deployed to GitHub]
-    P --> Q[End]
+## Why it is fast
+
+The obvious way to do this is one `POST /git/blobs` request per file. That design has a
+ceiling it cannot cross, and it is not bandwidth or concurrency:
+
+> GitHub's secondary rate limit allows **900 points per minute**, and **every POST costs
+> 5 points** — a hard cap of **180 POSTs per minute**.
+> ([rate limit docs](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api))
+
+One request per file therefore needs **at least 16.7 minutes for 3,000 files**, no matter
+how many threads you throw at it. Adding concurrency just makes you hit `403 secondary
+rate limit` sooner.
+
+The fast path avoids the per-file request entirely:
+
+| Technique | Effect |
+|---|---|
+| **Inline content in tree entries** — the [tree API](https://docs.github.com/en/rest/git/trees#create-a-tree) accepts `content` per entry and writes the blob for you | ~3,000 POSTs collapse into ~10 |
+| **Local git SHA-1 diffing** — the SHA git would assign is computed locally and compared with the branch's tree | Unchanged files cost zero requests |
+| **Content deduplication** — identical bytes upload once; blobs already in the repo are referenced by SHA | Repeated assets are free |
+| **Streaming worker pool** for the binary files that genuinely need blobs | No batch barriers waiting on the slowest file |
+| **Proactive rate-limit pacing** against the documented point budget, plus retry with backoff honouring `Retry-After` | Never trips the limit; survives 5xx and network blips |
+| **Parallel ZIP decompression** and connection reuse | Extraction and hashing overlap with I/O |
+
+Only text files can ride inline (the API's `content` field is a JSON string), so binaries
+still take the blob route — which is why the request count scales with the number of
+*binary* files, not the total.
+
+## Measured results
+
+From `tests/benchmark.py`, which runs both implementations against a mock GitHub API that
+simulates realistic latency **and enforces the real 900-points/minute secondary limit**.
+The "original" rows run the pre-optimisation `app.py` verbatim, pulled out of git history.
+
+```
+scenario                                  files       time   requests     ok
+------------------------------------------------------------------------------
+New engine, first deploy                   3000      72.7s        210    yes
+New engine, no-op redeploy                 3000       2.0s          3    yes
+New engine, 1 file changed                 3000       4.4s          7    yes
+Original, rate limit OFF (400 files)        400      13.9s        407    yes
+Original, projected to 3000 (no limit)     3000    1.7 min       3005      -
+Original, floor imposed by rate limit      3000   16.7 min       3005      -
+Original, rate limit ON (400 files)         400       5.9s        184     NO
 ```
 
-GitHub ZIP Deployer allows you to upload the contents of a ZIP file to a GitHub repository without cloning or using Git commands. Each language implementation follows the same workflow:
+Two things worth reading twice:
 
-1. Read a ZIP file from disk.
-2. Filter out system metadata (__MACOSX, .DS_Store).
-3. Interact with the GitHub API to create blobs, build a tree, create a commit, and update a branch reference.
-4. Provide real-time colored log output.
+* The original implementation **fails outright** once the real rate limit is enforced —
+  it has no retry logic, so the first `403` aborts the deploy mid-way, leaving the branch
+  untouched and the work wasted.
+* The new engine's 3,000-file deploy was verified **byte for byte** (3000/3000) against
+  locally computed git SHAs after the upload.
 
-All tools are self-contained, require no external servers, and run entirely on your machine.
+Numbers are latency-simulated rather than measured against github.com; what they capture
+is the shape of the work — how many round trips, and whether the rate limit is tripped —
+which is what governs real-world wall time.
 
-## Language Versions
+## Optimised implementations
 
-| Language | File | Dependencies | Run Command |
-|----------|------|--------------|--------------|
-| Python | app.py | requests, colorama | `python app.py` |
-| Go | app.go | (none, uses stdlib) | `go run app.go` |
-| C++ | app.cxx | libcurl, libzip, nlohmann/json | `g++ -o app app.cxx -lcurl -lzip && ./app` |
-| Erlang | app.erl | jsx, ibrowse (or httpc) | `escript app.erl` |
-| Ruby | app.rb | rubyzip, json | `ruby app.rb` |
-| PHP | index.php | zip, curl (extensions) | `php index.php` |
-| Lua | app.lua | luasocket, lua-zip, json-lua | `lua app.lua` |
-| Io | app.io | (requires Io language with Zip addon) | `io app.io` |
-| Rebol | app.reb | (Rebol 2 or 3 with Base64) | `rebol app.reb` |
-| Haskell | app.hs | stack with aeson, zip-archive, http-conduit | `stack app.hs` |
-| Forth | app.fs | Gforth, curl, jq, unzip | `gforth app.fs` |
+| Implementation | Status |
+|---|---|
+| [`app.py`](app.py) (Python) | Fast engine — inline trees, SHA diffing, retries, verification |
+| [`index.html`](index.html) (browser) | Fast engine — same algorithm in the browser |
+| The other 9 language ports | Still the original one-blob-per-file approach; fine for small archives, subject to the 16.7-minute floor for large ones |
 
-Additionally, a browser-based HTML/JavaScript version is available in the original repository (index.html) for users who prefer a graphical interface.
+Porting the fast engine to the remaining languages is a good contribution — the Python
+version is the reference implementation, and `tests/mock_github.py` will validate any port.
 
-## Prerequisites
+## Quick start
 
-- A GitHub account.
-- A personal access token with at least the `repo` scope.  
-  [Create one here](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens).
-- The required runtime and libraries for your chosen language (see table above).
+### Browser
 
-## Installation
-
-Clone the repository:
-
-```bash
-git clone https://github.com/iciiwhite/zip-deployer.git
-cd github-zip-deployer
-```
-
-Then follow the language-specific setup.
+Open [`index.html`](index.html) — no install, no server. Paste a token, pick a repo, drop
+a ZIP. The token stays in the page and is never stored or transmitted anywhere except
+api.github.com.
 
 ### Python
 
 ```bash
-pip install requests colorama
-python app.py
+python app.py                                   # interactive prompts
 ```
 
-### Go
+Or non-interactively, which is what you want in CI:
 
 ```bash
-go run app.go
-# or build: go build -o deploy app.go
+export GITHUB_TOKEN=ghp_...
+python app.py --owner octocat --repo hello-world --zip ./site.zip
 ```
 
-### C++
+No third-party packages are required. `requests` is used automatically for connection
+pooling when it happens to be installed; otherwise the standard library handles it.
 
-Install dependencies (example for Ubuntu):
+#### Options
+
+| Flag | Purpose |
+|---|---|
+| `--owner`, `--repo`, `--branch`, `--zip` | Target and source (prompted if omitted) |
+| `--token` | Token; prefer `$GITHUB_TOKEN` so it stays out of shell history |
+| `--message`, `-m` | Commit message |
+| `--strip-root` | Drop the single wrapper folder many ZIPs add |
+| `--prune` | Delete repository files absent from the ZIP (mirror the archive) |
+| `--dry-run` | Analyse the archive and estimate requests without writing |
+| `--json` | Machine-readable summary on stdout |
+| `--workers` | Parallel connections for blob uploads (default 12) |
+| `--no-inline` | Disable inline tree content — the old slow path, for debugging |
+| `--no-verify` | Skip the post-upload verification read |
+| `--api-base` | Point at GitHub Enterprise or a test server |
+| `--quiet`, `-q` | Only warnings and errors |
+
+Example output:
+
+```
+$ python app.py --owner octocat --repo hello-world --zip site.zip
+
+GitHub ZIP Deployer — fast edition
+
+[14:32:15] - Reading site.zip (12.4 MB)...
+[14:32:16] - Extracted and hashed 3000 file(s), 41.2 MB in 0.71s
+[14:32:16] - Target: octocat/hello-world on branch 'main'
+[14:32:16] - Resolving branch 'main'...
+[14:32:17] - Reading existing tree to skip unchanged files...
+[14:32:17] - Plan: 2806 inlined into tree, 194 uploaded as blobs, 0 reused, 0 unchanged.
+[14:32:18] - Uploading 194 binary/large file(s) as blobs on 12 connections...
+[14:32:44] -   -> 194/194 blobs (7.4/s)
+[14:32:44] - Writing 3000 tree entries in 8 request(s)...
+[14:33:22] - Verifying tree contents against locally computed SHAs...
+[14:33:28] + Verification passed — every file matches byte for byte.
+[14:33:29] + Deployed 3000 file(s) in 72.7s (41 files/s) using 210 API requests.
+```
+
+## How it works
+
+```mermaid
+flowchart TD
+    A[Read ZIP] --> B[Extract + hash in parallel<br/>local git SHA-1 per file]
+    B --> C[Resolve branch<br/>init repo if empty]
+    C --> D[Read existing tree recursively]
+    D --> E{File SHA already<br/>at that path?}
+    E -->|Yes| F[Skip: zero requests]
+    E -->|No| G{Valid UTF-8?}
+    G -->|Yes| H[Inline into tree entry]
+    G -->|No| I[Upload blob<br/>deduplicated, pooled]
+    H --> J[POST /git/trees in chunks<br/>~400 entries each, chained]
+    I --> J
+    J --> K[Verify tree against local SHAs]
+    K -->|Mismatch| L[Repair via blob upload]
+    L --> K
+    K -->|Clean| M[Create commit]
+    M --> N[Update branch ref]
+```
+
+1. **Read and hash.** Members are decompressed across a thread pool. `__MACOSX`,
+   `.DS_Store`, `Thumbs.db`, `.git/` and any `..` traversal are dropped. The executable
+   bit is preserved. Each file gets the SHA-1 git itself would assign.
+2. **Diff.** The branch tree is read once; files whose path and SHA already match are
+   skipped entirely.
+3. **Split.** Valid UTF-8 goes inline into tree entries; binaries and files above 1 MB go
+   the blob route, deduplicated by content SHA.
+4. **Write.** Trees are written in chunks bounded by entry count and payload size, each
+   chained onto the previous via `base_tree`.
+5. **Verify.** The resulting tree is read back and compared against the locally computed
+   SHAs. Any mismatch is repaired with a real blob upload before the commit is created.
+6. **Commit** and update the branch ref — a single commit, so the branch is never left in
+   a half-deployed state.
+
+## Testing
 
 ```bash
-sudo apt install libcurl4-openssl-dev libzip-dev nlohmann-json3-dev
-g++ -o app app.cxx -lcurl -lzip
-./app
+./tests/run_all.sh            # everything, quick benchmark
+./tests/run_all.sh --full     # everything, full 3000-file benchmark
 ```
 
-### Erlang
-
-Ensure jsx and ibrowse are available (use rebar3 or install via apt install erlang-jsx). Then:
+Individually:
 
 ```bash
-escript app.erl
+python3 tests/test_deploy.py        # Python correctness (19 tests)
+node tests/test_browser.mjs         # browser end-to-end (needs: npm i --no-save jszip)
+python3 tests/benchmark.py          # head-to-head benchmark
+python3 tests/mock_github.py        # run the mock API standalone on :8080
 ```
 
-### Ruby
+[`tests/mock_github.py`](tests/mock_github.py) is a deliberately strict stand-in for
+GitHub's Git Data API:
 
-```bash
-gem install rubyzip
-ruby app.rb
-```
+* blob SHAs are **real git SHA-1s**, so any corruption of content — encoding, newlines,
+  truncation — changes the SHA and fails the test;
+* tree entries must supply exactly one of `sha` or `content`, and an unknown `sha` is
+  rejected with 422, as the real API does;
+* the 900-points/minute secondary limit is enforced, with `403` + `Retry-After`;
+* latency is simulated, including a per-entry cost for large tree writes, so a request
+  carrying 400 files is not pretended to be free;
+* faults can be injected (every Nth request returns a transient 500) to exercise retries.
 
-### PHP
+The browser tests run the script **extracted from `index.html` itself** in a Node VM with
+a stubbed DOM and `fetch` aimed at the mock, so the shipped code is what gets tested.
 
-```bash
-php index.php
-```
+Coverage includes byte-exact round trips for unicode, CRLF, empty files, files containing
+NUL bytes, binaries and executables; incremental redeploys; deduplication; pruning; path
+filtering; empty-repository bootstrap; flaky-API retries; and the SHA-1 fallback used when
+`crypto.subtle` is unavailable.
 
-### Lua
+## Other language versions
 
-Install LuaRocks and dependencies:
+| Language | File | Dependencies | Run Command |
+|----------|------|--------------|--------------|
+| Python | app.py | none (optional: requests, colorama) | `python app.py` |
+| Go | app.go | (none, uses stdlib) | `go run app.go` |
+| C++ | app.cpp | libcurl, libzip, nlohmann/json | `g++ -o app app.cpp -lcurl -lzip && ./app` |
+| Erlang | app.erl | jsx, ibrowse (or httpc) | `escript app.erl` |
+| Ruby | app.rb | rubyzip, json | `ruby app.rb` |
+| PHP | index.php | zip, curl (extensions) | `php index.php` |
+| Lua | app.lua | luasocket, lua-zip, json-lua | `lua app.lua` |
+| Io | app.io | Io with the Zip addon | `io app.io` |
+| Rebol | app.reb | Rebol 2 or 3 with Base64 | `rebol app.reb` |
+| Haskell | app.hs | stack with aeson, zip-archive, http-conduit | `stack app.hs` |
+| Forth | app.fs | Gforth, curl, jq, unzip | `gforth app.fs` |
 
-```bash
-luarocks install luasocket
-luarocks install lua-zip
-luarocks install json-lua
-lua app.lua
-```
-### Io
+These still use the original one-request-per-file algorithm. They work well for small
+archives; for large ones, use the Python or browser version.
 
-Requires Io language with Zip addon. Install Io from iolanguage.org then:
+## Prerequisites
 
-```bash
-io app.io
-```
-
-### Rebol
-
-Use Rebol 2 or 3. The script uses to-json and from-json helpers. Run:
-
-```bash
-rebol app.reb
-```
-
-### Haskell
-
-Uses Stack. Run:
-
-```bash
-stack app.hs
-```
-
-#s# Forth
-
-Requires Gforth, curl, jq, and unzip. Run:
-
-```bash
-gforth app.fs
-```
-
-## Usage
-
-All language versions are interactive command-line tools. After starting the script, you will be prompted for:
-
-· Personal Access Token
-· Repository owner (username or organization)
-· Repository name
-· Target branch (default: main)
-· Path to the ZIP file
-
-### Example session (Python):
-
-```
-$ python app.py
-
-GitHub ZIP Deployer — Tool by Icii White
-
-🔑 Personal Access Token (repo scope): ghp_...
-👤 Repository owner (username or org): octocat
-📁 Repository name: hello-world
-🌿 Branch name (default: main): main
-🗂️  Path to ZIP file: ./project.zip
-
-[14:32:15] ➜ Target: octocat/hello-world on branch 'main'
-[14:32:15] ➜ ZIP file: ./project.zip
-[14:32:15] ➜ Reading ZIP file in memory...
-[14:32:16] ➜ Found 42 valid files to process.
-[14:32:16] ➜ Fetching branch 'main' details...
-[14:32:17] ➜ Uploading files as blobs...
-[14:32:18]   -> Uploaded 10 / 42 files...
-[14:32:19]   -> Uploaded 20 / 42 files...
-...
-[14:32:25] ➜ Constructing new Git tree...
-[14:32:26] ➜ Creating commit...
-[14:32:27] ➜ Updating branch reference to new commit...
-[14:32:28] ✓ Successfully deployed 42 files to octocat/hello-world on branch 'main'! 
-[14:32:28] ➜ https://github.com/octocat/hello-world/tree/main
-```
-
-All implementations produce similar colored output with timestamps.
-
-## How It Works
-
-1. **Authentication** – The tool uses the provided personal access token for all GitHub API requests.
-  
-2. **ZIP Processing** – The ZIP file is read and each file is extracted. Files inside __MACOSX/ or named .DS_Store are ignored.
-
-3. **Branch Handling** – The tool attempts to fetch the current commit SHA of the target branch. If the branch does not exist or the repository is empty, it creates an initial commit with a README.md.
-
-4. **Blob Upload** – Each file is uploaded as a Git blob using the POST /repos/{owner}/{repo}/git/blobs endpoint. Uploads are performed in parallel batches (default batch size = 10).
-
-5. **Tree Creation** – A new Git tree is created that references all uploaded blobs, using the existing tree as the base.
-
-6. **Commit Creation** – A commit is created with the new tree and the parent commit from the branch.
-
-7. **Branch Update** – The branch reference is updated to point to the new commit.
-
-All API calls are authenticated and respect GitHub's rate limits.
+- A GitHub account.
+- A personal access token with the `repo` scope
+  ([create one](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)).
+- Python 3.8+ for `app.py`, or any modern browser for `index.html`.
 
 ## Troubleshooting
 
-· **Authentication failed** – Verify that your token has the repo scope and is valid. Ensure you are using the correct owner/repo names.
-
-· **Branch not found / empty repository** – The tool automatically initializes empty repositories. If you see errors, you may need to manually create an initial commit (e.g., via GitHub web interface) before using the tool.
-
-· **Rate limiting** – Authenticated requests have a limit of 5,000 per hour. If you exceed this, wait an hour or use a different token.
-
-· **Large ZIP files** – The tools load the entire ZIP into memory. For very large archives (e.g., >500MB), you may encounter memory issues. Consider splitting the archive or using a different approach.
-
-· **Missing dependencies** – Refer to the Installation section for each language. Most errors are due to missing libraries or incorrect runtime versions.
+* **Authentication failed** — check the token has `repo` scope and the owner/repo names
+  are right. Fine-grained tokens need "Contents: write" on the target repository.
+* **Secondary rate limit** — the Python and browser versions pace themselves under the
+  budget and back off automatically; you should not see this. If you do, lower
+  `--workers` or `--points-per-min`.
+* **Branch not found / empty repository** — handled automatically: an initial commit with
+  a `README.md` is created, then the deploy proceeds.
+* **A file is over 100 MB** — GitHub's blob API rejects it. The deploy stops before
+  writing anything and names the offending files. Use Git LFS for those.
+* **Large archives** — the tools hold the archive and its extracted contents in memory.
+  Budget roughly 2–3x the uncompressed size.
+* **Verification failed** — the deploy aborts *before* creating the commit, so the branch
+  is untouched. Please open an issue with the reported paths.
 
 ## Contributing
 
-Contributions are **welcome**. Please open an issue or submit a pull request. Areas for improvement:
+Contributions are welcome. Good next steps:
 
-· **Add more language versions** (Rust, Node.js, C#, etc.)
-· **Improve error handling** and **retry logic.**
-· **Support incremental updates** (only changed files).
-· Add a configuration file option to avoid interactive prompts.
+* Port the fast engine to the remaining languages (`tests/mock_github.py` validates ports).
+* Resumable deploys for very large archives.
+* A GitHub Action wrapper.
 
 ## License
 
-> This project is licensed under the MIT License. See the [license](LICENSE) file for details.
+This project is licensed under the MIT License. See [LICENSE.md](LICENSE.md).
 
-> Disclaimer
-
-This software is provided "**as is**", without warranty of any kind. Use at your own risk. Always ensure you have backups of your repository before performing bulk operations.
+> **Disclaimer** — provided "as is", without warranty of any kind. Use at your own risk,
+> and keep backups before bulk operations. `--prune` deletes files.
