@@ -128,6 +128,7 @@ class MockGitHub:
         jitter: float = 0.4,
         points_per_min: int = 900,
         fail_every: int = 0,
+        max_body_bytes: int = 0,
     ):
         self.repos: dict[str, Repo] = {}
         self.latency = latency
@@ -142,6 +143,9 @@ class MockGitHub:
         self.fail_every = fail_every
         self.injected_failures = 0
         self._request_counter = 0
+        # 0 = unlimited. Set to exercise the deployer's split-and-retry path
+        # when a tree POST comes in oversized (real GitHub answers 413).
+        self.max_body_bytes = max_body_bytes
 
     def should_fail(self) -> bool:
         if not self.fail_every:
@@ -220,6 +224,16 @@ class Handler(BaseHTTPRequestHandler):
         # exempt from rate limiting and fault injection so that assertions can
         # always read the repository state back.
         is_debug = len(parts) > 3 and parts[3] == "_debug"
+
+        if (
+            not is_debug
+            and backend.max_body_bytes
+            and len(getattr(self, "_raw_body", b"")) > backend.max_body_bytes
+        ):
+            backend.stats.start(f"{method} TOO_LARGE")
+            backend.stats.finish()
+            self._error(413, "Request Entity Too Large")
+            return
 
         points = 1 if method == "GET" else 5
         wait = 0.0 if is_debug else backend.limiter.charge(points)

@@ -23,6 +23,7 @@ import argparse
 import base64
 import io
 import json
+import math
 import os
 import random
 import re
@@ -55,33 +56,84 @@ POINTS_PER_MIN = 900
 # --------------------------------------------------------------------------
 
 
+# Advertised GitHub language bar for the Astro/TypeScript fixture.
+# Shares are percent of *bytes*, which is how GitHub Linguist reports them.
+ASTRO_LANGUAGE_MIX = {
+    "TypeScript": 92.2,
+    "CSS": 4.9,
+    "Astro": 2.3,
+    "Other": 0.6,
+}
+
+
+def _mix_byte_targets(grand: int, shares: dict[str, float]) -> dict[str, int]:
+    """Largest-remainder allocation so targets sum to `grand` exactly."""
+    raw = {key: grand * (pct / 100.0) for key, pct in shares.items()}
+    targets = {key: int(value) for key, value in raw.items()}
+    leftover = grand - sum(targets.values())
+    order = sorted(shares, key=lambda key: (raw[key] - targets[key]), reverse=True)
+    for i in range(leftover):
+        targets[order[i % len(order)]] += 1
+    return targets
+
+
+def _grow(data: bytes, extra: int, line: bytes) -> bytes:
+    """Append comment lines so `data` grows by exactly `extra` bytes."""
+    if extra <= 0:
+        return data
+    if not line.endswith(b"\n"):
+        line += b"\n"
+    if data and not data.endswith(b"\n"):
+        data += b"\n"
+        extra -= 1
+        if extra <= 0:
+            return data
+    reps, rem = divmod(extra, len(line))
+    return data + line * reps + (b" " * rem)
+
+
 def make_astro_zip(n_files: int, seed: int = 4242) -> tuple[bytes, dict[str, bytes]]:
     """An Astro + TypeScript site matching a real repo's language breakdown.
 
     Target mix by bytes, which is how GitHub measures it:
         TypeScript 92.2%, CSS 4.9%, Astro 2.3%, Other 0.6%
 
-    Sizes are budgeted rather than guessed, so the generated corpus actually
-    lands on those percentages. One oversized TypeScript bundle is included on
-    purpose: at over 1 MB it crosses the threshold where the deployer stops
-    inlining and switches to a blob upload, so that path gets exercised by a
-    file type this repo is actually full of.
+    Files are generated at realistic sizes, then a final pass snaps each
+    language onto those percentages exactly (to one displayed decimal).
+    One oversized TypeScript bundle is included when the corpus is large
+    enough: at over 1 MB it crosses the threshold where the deployer stops
+    inlining and switches to a blob upload, so that path gets exercised by
+    a file type this kind of repo is actually full of.
     """
     rng = random.Random(seed)
     files: dict[str, bytes] = {}
     names = ["Button", "Card", "Nav", "Hero", "Footer", "Modal", "Table", "Badge"]
     hooks = ["useStore", "useFetch", "useTheme", "useMedia", "useForm"]
 
-    avg_bytes = 6 * 1024
-    total_budget = n_files * avg_bytes
-    budget = {
-        "ts": total_budget * 0.922,
-        "css": total_budget * 0.049,
-        "astro": total_budget * 0.023,
-        "other": total_budget * 0.006,
-    }
+    n_astro = max(1, int(n_files * 0.05))
+    n_css = max(1, int(n_files * 0.03))
+    n_other = max(1, int(n_files * 0.02))
+    n_ts = max(2, n_files - n_astro - n_css - n_other)
 
-    def pad(body: str, target: int, comment: str = "//") -> bytes:
+    avg_bytes = 6 * 1024
+    total_budget = max(n_files * avg_bytes, 64 * 1024)
+    ts_budget = total_budget * 0.922
+    # Only plant a >1 MB bundle when the TypeScript budget can absorb it
+    # without wrecking the mix (small fixtures stay honest).
+    if ts_budget >= 3_000_000:
+        big_bundle = 1_500_000
+    elif ts_budget >= 1_600_000:
+        big_bundle = 1_050_000
+    else:
+        big_bundle = 0
+
+    n_small_ts = n_ts - (1 if big_bundle else 0)
+    per_ts = max(256, int((ts_budget - big_bundle) / max(n_small_ts, 1)))
+    per_css = max(128, int(total_budget * 0.049 / n_css))
+    per_astro = max(256, int(total_budget * 0.023 / n_astro))
+    per_other = max(64, int(total_budget * 0.006 / max(n_other, 1)))
+
+    def approx_pad(body: str, target: int, line_fmt: str) -> bytes:
         data = body.encode()
         if len(data) >= target:
             return data
@@ -89,21 +141,14 @@ def make_astro_zip(n_files: int, seed: int = 4242) -> tuple[bytes, dict[str, byt
         size = len(data)
         n = 0
         while size < target:
-            line = f"{comment} {rng.choice(hooks)}-{n:06d} padding to keep the fixture honestly sized\n"
+            line = line_fmt.format(n=n, hook=rng.choice(hooks))
             filler.append(line)
             size += len(line.encode())
             n += 1
         return data + "".join(filler).encode()
 
-    n_astro = max(1, int(n_files * 0.05))
-    n_css = max(1, int(n_files * 0.03))
-    n_other = max(1, int(n_files * 0.02))
-    n_ts = max(1, n_files - n_astro - n_css - n_other)
-
-    # --- TypeScript (92.2%) -------------------------------------------------
-    big_bundle = 1_500_000  # > 1 MB: forces the blob path
-    per_ts = max(256, int((budget["ts"] - big_bundle) / max(n_ts - 1, 1)))
-    for i in range(n_ts - 1):
+    ts_paths: list[str] = []
+    for i in range(n_small_ts):
         name = rng.choice(names)
         body = (
             "import type { APIContext } from 'astro';\n"
@@ -116,22 +161,31 @@ def make_astro_zip(n_files: int, seed: int = 4242) -> tuple[bytes, dict[str, byt
             "  const total = items.reduce((sum, item) => sum + item.value, 0);\n"
             "  return `${id}:${title}:${total}`;\n}\n"
         )
-        files[f"src/lib/module{i:05d}.ts"] = pad(body, per_ts)
-    files["src/generated/api-types.ts"] = pad(
-        "// Generated API types — do not edit.\nexport type Id = string;\n", big_bundle
-    )
+        path = f"src/lib/module{i:05d}.ts"
+        files[path] = approx_pad(
+            body, per_ts, "// {hook}-{n:06d} padding to keep the fixture honestly sized\n"
+        )
+        ts_paths.append(path)
+    if big_bundle:
+        path = "src/generated/api-types.ts"
+        files[path] = approx_pad(
+            "// Generated API types — do not edit.\nexport type Id = string;\n",
+            big_bundle,
+            "// {hook}-{n:06d} padding to keep the fixture honestly sized\n",
+        )
+        ts_paths.append(path)
 
-    # --- CSS (4.9%) ---------------------------------------------------------
-    per_css = max(128, int(budget["css"] / n_css))
+    css_paths: list[str] = []
     for i in range(n_css):
         body = f"/* stylesheet {i} */\n:root {{ --gap: 8px; }}\n" + "".join(
             f".u-{i}-{j} {{ color: #{rng.randint(0, 0xFFFFFF):06x}; margin: calc(var(--gap) * {j}); }}\n"
             for j in range(12)
         )
-        files[f"src/styles/style{i:04d}.css"] = pad(body, per_css, comment="/*!")
+        path = f"src/styles/style{i:04d}.css"
+        files[path] = approx_pad(body, per_css, "/* {hook}-{n:06d} padding */\n")
+        css_paths.append(path)
 
-    # --- Astro (2.3%) -------------------------------------------------------
-    per_astro = max(256, int(budget["astro"] / n_astro))
+    astro_paths: list[str] = []
     for i in range(n_astro):
         name = rng.choice(names)
         body = (
@@ -141,30 +195,76 @@ def make_astro_zip(n_files: int, seed: int = 4242) -> tuple[bytes, dict[str, byt
             "    <p>Ünïcode ok — 🚀 日本語</p>\n    <slot />\n  </main>\n</Layout>\n"
             f"<style>\n  .page-{i} {{ padding: {i % 32}px; }}\n</style>\n"
         )
-        files[f"src/pages/page{i:04d}.astro"] = pad(body, per_astro, comment="<!--")
+        path = f"src/pages/page{i:04d}.astro"
+        files[path] = approx_pad(body, per_astro, "<!-- {hook}-{n:06d} padding -->\n")
+        astro_paths.append(path)
 
-    # --- Other (0.6%): configs, markdown, JSON and binary assets ------------
-    per_other = max(64, int(budget["other"] / max(n_other, 1)))
+    other_paths: list[str] = []
     for i in range(n_other):
         kind = i % 4
         if kind == 0:
-            files[f"public/icons/icon{i:04d}.svg"] = (
+            path = f"public/icons/icon{i:04d}.svg"
+            files[path] = (
                 f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
                 f'<path d="M0 0h24v24H0z" fill="#{i % 0xFFFFFF:06x}"/></svg>\n'
             ).encode()
         elif kind == 1:
             # binary asset -> must take the blob path
-            files[f"public/img/photo{i:04d}.webp"] = bytes([0x52, 0x49, 0x46, 0x46]) + bytes(
+            path = f"public/img/photo{i:04d}.webp"
+            files[path] = bytes([0x52, 0x49, 0x46, 0x46]) + bytes(
                 rng.getrandbits(8) for _ in range(min(per_other, 8192))
             )
         elif kind == 2:
-            files[f"content/docs/doc{i:04d}.md"] = pad(f"# Doc {i}\n\n", per_other, comment="<!--")
+            path = f"content/docs/doc{i:04d}.md"
+            files[path] = approx_pad(f"# Doc {i}\n\n", per_other, "<!-- {hook}-{n:06d} padding -->\n")
         else:
-            files[f"data/conf{i:04d}.json"] = json.dumps({"id": i, "flags": names}).encode()
+            path = f"data/conf{i:04d}.json"
+            files[path] = json.dumps({"id": i, "flags": names}).encode()
+        other_paths.append(path)
 
-    files["astro.config.mjs"] = b"import { defineConfig } from 'astro/config';\nexport default defineConfig({});\n"
+    # Keep config in TypeScript / JSON so a stray .mjs does not show up as JS.
+    files["astro.config.ts"] = (
+        b"import { defineConfig } from 'astro/config';\nexport default defineConfig({});\n"
+    )
     files["tsconfig.json"] = b'{\n  "extends": "astro/tsconfigs/strict"\n}\n'
     files["package.json"] = b'{\n  "name": "site",\n  "type": "module"\n}\n'
+    ts_paths.append("astro.config.ts")
+    other_paths.extend(["tsconfig.json", "package.json"])
+
+    # Text host so the final snap can grow "Other" without touching binaries.
+    files["content/docs/_mix.md"] = b"# Language-mix pad\n"
+    other_paths.append("content/docs/_mix.md")
+
+    groups = {
+        "TypeScript": ts_paths,
+        "CSS": css_paths,
+        "Astro": astro_paths,
+        "Other": other_paths,
+    }
+    current = {lang: sum(len(files[p]) for p in paths) for lang, paths in groups.items()}
+    grand = sum(current.values())
+    for lang, pct in ASTRO_LANGUAGE_MIX.items():
+        grand = max(grand, math.ceil(current[lang] * 100.0 / pct))
+    targets = _mix_byte_targets(grand, ASTRO_LANGUAGE_MIX)
+    guard = 0
+    while any(targets[lang] < current[lang] for lang in ASTRO_LANGUAGE_MIX) and guard < 2000:
+        grand += 1
+        targets = _mix_byte_targets(grand, ASTRO_LANGUAGE_MIX)
+        guard += 1
+
+    pad_lines = {
+        "TypeScript": b"// mix-pad\n",
+        "CSS": b"/* mix-pad */\n",
+        "Astro": b"<!-- mix-pad -->\n",
+        "Other": b"<!-- mix-pad -->\n",
+    }
+    binary_ext = (".webp", ".png", ".jpg", ".jpeg", ".gif", ".woff", ".woff2")
+    for lang, paths in groups.items():
+        need = targets[lang] - current[lang]
+        if need <= 0:
+            continue
+        host = next((p for p in reversed(paths) if not p.endswith(binary_ext)), paths[-1])
+        files[host] = _grow(files[host], need, pad_lines[lang])
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:

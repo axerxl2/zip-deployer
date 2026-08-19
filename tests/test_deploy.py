@@ -295,16 +295,98 @@ class TestPayloadBounds(DeployTestCase):
         for path, expected in files.items():
             self.assertEqual(remote[path], expected, f"CJK content mangled for {path}")
 
-    def test_large_text_file_round_trips_via_blob(self):
-        # Above MAX_INLINE_BYTES a text file must switch to a blob upload —
-        # lockfiles, bundles and source maps in real projects land here.
+    def test_generated_typescript_bundle_stays_on_the_fast_path(self):
+        # A 1.5 MB generated .ts file is typical in an Astro/TS repo.
+        # It must ride inline — one extra blob POST is the old "low" path.
         big = ("export const data = 'x';\n" * 60000).encode()
-        self.assertGreater(len(big), app.MAX_INLINE_BYTES)
+        self.assertGreater(len(big), 1024 * 1024)
+        self.assertLess(len(big), app.MAX_INLINE_BYTES)
         files = {"src/generated/api-types.ts": big, "small.ts": b"export const a = 1;\n"}
         result = self.deploy(build_zip(files))
-        self.assertEqual(result.blobs_uploaded, 1)   # only the big one
-        self.assertEqual(result.inlined, 1)
+        self.assertEqual(result.blobs_uploaded, 0)
+        self.assertEqual(result.inlined, 2)
         self.assertEqual(self.remote_files()["src/generated/api-types.ts"], big)
+
+    def test_text_bigger_than_a_tree_request_still_round_trips(self):
+        huge = b"export const x = 1;\n" * ((app.MAX_INLINE_BYTES // 20) + 200)
+        self.assertFalse(app.is_inlineable(huge, "src/huge.ts"))
+        result = self.deploy(build_zip({"src/huge.ts": huge}))
+        self.assertEqual(result.blobs_uploaded, 1)
+        self.assertEqual(self.remote_files()["src/huge.ts"], huge)
+
+
+class TestAstroProfile(DeployTestCase):
+    """TypeScript 92.2% / CSS 4.9% / Astro 2.3% / Other 0.6% — send stays fast."""
+
+    def test_language_mix_matches_advertised_breakdown(self):
+        from tests.benchmark import ASTRO_LANGUAGE_MIX, language_mix, make_astro_zip
+
+        for n in (80, 400, 3000):
+            _, files = make_astro_zip(n)
+            mix = dict(language_mix(files))
+            for lang, target in ASTRO_LANGUAGE_MIX.items():
+                self.assertEqual(
+                    round(mix.get(lang, 0.0), 1),
+                    target,
+                    f"{lang} at n={n}: got {mix.get(lang, 0.0):.3f}%",
+                )
+            extras = {lang: share for lang, share in mix.items() if lang not in ASTRO_LANGUAGE_MIX}
+            for lang, share in extras.items():
+                self.assertLess(share, 0.05, f"unexpected {lang} {share:.2f}% at n={n}")
+
+    def test_astro_corpus_sends_fast_and_stays_byte_exact(self):
+        from tests.benchmark import make_astro_zip
+
+        zip_bytes, expected = make_astro_zip(400)
+        result = self.deploy(zip_bytes)
+        remote = self.remote_files()
+
+        self.assertEqual(result.total_files, len(expected))
+        self.assertLess(result.api_requests, 45, "send used too many API requests")
+        self.assertEqual(self.backend.limiter.rejections, 0)
+        source = [p for p in expected if p.endswith((".ts", ".tsx", ".css", ".astro"))]
+        binaries = [p for p, data in expected.items() if not app.is_inlineable(data, p)]
+        self.assertTrue(source)
+        for path in source:
+            self.assertTrue(
+                app.is_inlineable(expected[path], path),
+                f"{path} ({len(expected[path])} bytes) must stay on the fast path",
+            )
+        self.assertEqual(result.blobs_uploaded, len(binaries))
+        self.assertTrue(all(p.endswith(".webp") for p in binaries), binaries)
+        self.assertEqual(result.inlined, len(expected) - len(binaries))
+        self.assertLess(self.backend.stats.max_request_bytes, 6 * 1024 * 1024)
+        for path, data in expected.items():
+            self.assertEqual(remote[path], data, f"content mismatch for {path}")
+
+
+class TestAdaptiveTreeSend(DeployTestCase):
+    def test_oversized_tree_is_split_instead_of_crashing(self):
+        """A 413 from GitHub must split the chunk and finish the send."""
+        self.backend.max_body_bytes = 50_000
+        files = {
+            f"src/mod{i:03d}.ts": (f"export const n = {i};\n" + "export const s = 'xxxx';\n" * 30).encode()
+            for i in range(80)
+        }
+        result = self.deploy(build_zip(files))
+        remote = self.remote_files()
+        self.assertEqual(len(remote), 80)
+        self.assertGreaterEqual(result.tree_calls, 2)
+        for path, data in files.items():
+            self.assertEqual(remote[path], data)
+
+    def test_pack_tree_items_stays_within_budget(self):
+        items = [
+            {"path": f"src/m{i:04d}.ts", "mode": "100644", "type": "blob", "content": "x" * 8000}
+            for i in range(50)
+        ]
+        chunks = app.pack_tree_items(items, max_entries=400, max_bytes=100_000)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            payload = app.encode_json({"tree": chunk, "base_tree": "a" * 40})
+            self.assertLessEqual(len(payload), 100_000 + 2048)
+            self.assertLessEqual(len(chunk), 400)
+        self.assertEqual(sum(len(c) for c in chunks), 50)
 
 
 class TestLocalHelpers(unittest.TestCase):
