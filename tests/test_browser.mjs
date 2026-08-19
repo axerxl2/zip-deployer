@@ -91,7 +91,7 @@ function extractScript() {
 
 function makeElement(id) {
     const listeners = {};
-    return {
+    const el = {
         id,
         value: '',
         checked: false,
@@ -103,8 +103,14 @@ function makeElement(id) {
         listeners,
         classList: { add() {}, remove() {}, contains: () => false },
         addEventListener(name, fn) { (listeners[name] ||= []).push(fn); },
-        dispatch(name, event) { return Promise.all((listeners[name] || []).map((fn) => fn(event))); }
+        dispatch(name, event) { return Promise.all((listeners[name] || []).map((fn) => fn(event))); },
+        insertAdjacentHTML(position, html) {
+            if (position === 'beforeend') el.innerHTML += html;
+            else if (position === 'afterbegin') el.innerHTML = html + el.innerHTML;
+            else el.innerHTML += html;
+        }
     };
+    return el;
 }
 
 function makeSandbox({ withSubtle = true } = {}) {
@@ -287,6 +293,25 @@ async function main() {
         check(run6.log.includes('built-in SHA-1'), 'falls back when crypto.subtle is missing');
         check(fallbackMatch, 'fallback SHA-1 produces an identical deployment');
         check(run6.log.includes('Verification passed'), 'fallback path still verifies clean');
+
+        // --- 8. binary assets must not poison later TypeScript inlining ------
+        console.log('\nbrowser: binaries do not force later .ts files down the blob path');
+        const mixed = {
+            'public/img/photo.webp': Buffer.from([0x52, 0x49, 0x46, 0x46, 0xff, 0xfe, 0xfd, 0x00]),
+            'public/img/logo.png': Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47]), Buffer.from([0xff, 0xfe])])
+        };
+        for (let i = 0; i < 200; i++) {
+            mixed[`src/lib/mod${String(i).padStart(3, '0')}.ts`] = Buffer.from(`export const n${i} = ${i};\n`);
+        }
+        const run7 = await runDeploy({ zipBuffer: await buildZip(mixed), owner: 'octocat', repo: 'astrots' });
+        const mixedFiles = await remoteFiles('octocat', 'astrots');
+        const mixedStats = await remoteStats('octocat', 'astrots');
+        const reqMatch = run7.log.match(/using (\d+) API requests/);
+        const mixedRequests = reqMatch ? Number(reqMatch[1]) : Infinity;
+        check(mixedFiles.has('src/lib/mod000.ts'), 'TypeScript files were deployed');
+        check(mixedRequests < 25, `200 .ts + 2 binaries cost ${mixedRequests} requests, not ~200`);
+        check(run7.log.includes('Verification passed'), 'mixed TS/binary send verified clean');
+        check(mixedStats.max_request_bytes < 6 * 1024 * 1024, 'mixed send stayed inside the payload budget');
 
         console.log(`\n${checks - failures}/${checks} checks passed`);
         return failures === 0 ? 0 : 1;

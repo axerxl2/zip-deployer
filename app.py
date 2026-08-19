@@ -65,7 +65,6 @@ POINTS_READ = 1               # GET / HEAD / OPTIONS
 
 MAX_TREE_ENTRIES = 400        # entries per POST /git/trees call
 MAX_TREE_BYTES = 3 * 1024 * 1024   # serialized payload budget per tree call
-JSON_ESCAPE_HEADROOM = 1.15   # allowance for JSON escaping of quotes/newlines
 MAX_INLINE_BYTES = 1024 * 1024     # bigger text files go the blob route
 BLOB_HARD_LIMIT = 100 * 1024 * 1024  # GitHub rejects blobs above ~100 MB
 
@@ -73,6 +72,56 @@ MODE_FILE = "100644"
 MODE_EXEC = "100755"
 
 SKIP_PATTERNS = ("__MACOSX", ".DS_Store", "Thumbs.db")
+
+# Wrapper + separators for {"tree":[...],"base_tree":"<40-char sha>"}.
+_TREE_WRAPPER_BYTES = 96
+
+
+def encode_json(data) -> bytes:
+    """UTF-8 JSON, compact non-ASCII. Shared so size estimates match the wire."""
+    return json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+
+def pack_tree_items(
+    tree_items: list[dict],
+    max_entries: int = MAX_TREE_ENTRIES,
+    max_bytes: int = MAX_TREE_BYTES,
+) -> list[list[dict]]:
+    """Pack tree entries into request-sized chunks using *actual* JSON bytes.
+
+    Estimating from character counts under-counts CJK and over-counts ASCII,
+    which either blows the payload (413 / timeout) or wastes a round trip.
+    Measuring the real UTF-8 JSON keeps each POST just under the budget.
+    """
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    current_bytes = _TREE_WRAPPER_BYTES
+    for item in tree_items:
+        item_bytes = len(encode_json(item)) + 2  # comma + space in the array
+        if current and (
+            len(current) >= max_entries or current_bytes + item_bytes > max_bytes
+        ):
+            chunks.append(current)
+            current = []
+            current_bytes = _TREE_WRAPPER_BYTES
+        current.append(item)
+        current_bytes += item_bytes
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def is_payload_too_large(exc: "GitHubError") -> bool:
+    """True when GitHub (or a proxy) rejected the body for being too big."""
+    if exc.status == 413:
+        return True
+    if exc.status not in (400, 422):
+        return False
+    msg = (exc.message or "").lower()
+    return any(
+        needle in msg
+        for needle in ("too large", "request entity", "payload", "size limit", "too big")
+    )
 
 # --------------------------------------------------------------------------
 # Logging
@@ -384,7 +433,7 @@ class GitHubClient:
         # ensure_ascii=False keeps non-ASCII as compact UTF-8 instead of
         # expanding every character to a 6-byte \\uXXXX escape, which on a
         # unicode-heavy repository inflates the payload by 1.5x or more.
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8") if data is not None else None
+        body = encode_json(data) if data is not None else None
         points = POINTS_READ if method in ("GET", "HEAD", "OPTIONS") else POINTS_WRITE
 
         last_error = None
@@ -696,40 +745,42 @@ class Deployer:
     # -- tree building -----------------------------------------------------
 
     def build_tree(self, tree_items: list[dict], base_tree: str, result: DeployResult) -> str:
-        """Create the tree in size-bounded chunks, chaining each onto the last."""
-        chunks: list[list[dict]] = []
-        current: list[dict] = []
-        current_bytes = 0
-        for item in tree_items:
-            # Measure UTF-8 bytes, not characters: a CJK character is one
-            # character but three bytes, so counting characters would
-            # underestimate a Japanese or emoji-heavy payload threefold. The
-            # headroom covers JSON escaping of quotes, newlines and control
-            # characters.
-            content = item.get("content", "")
-            item_bytes = int(len(content.encode("utf-8")) * JSON_ESCAPE_HEADROOM) + len(item["path"]) + 96
-            if current and (
-                len(current) >= MAX_TREE_ENTRIES or current_bytes + item_bytes > MAX_TREE_BYTES
-            ):
-                chunks.append(current)
-                current, current_bytes = [], 0
-            current.append(item)
-            current_bytes += item_bytes
-        if current:
-            chunks.append(current)
+        """Create the tree in size-bounded chunks, chaining each onto the last.
 
+        Chunks are packed from the real JSON byte length so a TypeScript-heavy
+        send fills each request without going over. If GitHub still rejects a
+        payload as too large, the chunk is split and retried — the deploy
+        does not crash mid-send.
+        """
+        chunks = pack_tree_items(tree_items)
         log(f"Writing {len(tree_items)} tree entries in {len(chunks)} request(s)...")
         tree_sha = base_tree
+        planned = len(chunks)
         for index, chunk in enumerate(chunks, 1):
-            payload = {"tree": chunk}
-            if tree_sha:
-                payload["base_tree"] = tree_sha
-            response = self.gh.request("POST", "/git/trees", payload)
-            tree_sha = response["sha"]
-            result.tree_calls += 1
-            if len(chunks) > 1:
-                log(f"  -> tree chunk {index}/{len(chunks)} ({len(chunk)} entries)")
+            tree_sha = self._post_tree_chunk(chunk, tree_sha, result)
+            if planned > 1:
+                log(f"  -> tree chunk {index}/{planned} ({len(chunk)} entries)")
         return tree_sha
+
+    def _post_tree_chunk(self, chunk: list[dict], base_sha: str, result: DeployResult) -> str:
+        payload = {"tree": chunk}
+        if base_sha:
+            payload["base_tree"] = base_sha
+        try:
+            response = self.gh.request("POST", "/git/trees", payload)
+        except GitHubError as exc:
+            if len(chunk) > 1 and is_payload_too_large(exc):
+                mid = max(1, len(chunk) // 2)
+                log(
+                    f"Tree chunk of {len(chunk)} entries was too large — "
+                    f"splitting into {mid} + {len(chunk) - mid} and retrying.",
+                    "warn",
+                )
+                first_sha = self._post_tree_chunk(chunk[:mid], base_sha, result)
+                return self._post_tree_chunk(chunk[mid:], first_sha, result)
+            raise
+        result.tree_calls += 1
+        return response["sha"]
 
     # -- verification ------------------------------------------------------
 

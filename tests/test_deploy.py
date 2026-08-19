@@ -307,6 +307,70 @@ class TestPayloadBounds(DeployTestCase):
         self.assertEqual(self.remote_files()["src/generated/api-types.ts"], big)
 
 
+class TestAstroProfile(DeployTestCase):
+    """TypeScript 92.2% / CSS 4.9% / Astro 2.3% / Other 0.6% — send stays fast."""
+
+    def test_language_mix_matches_advertised_breakdown(self):
+        from tests.benchmark import ASTRO_LANGUAGE_MIX, language_mix, make_astro_zip
+
+        for n in (80, 400, 3000):
+            _, files = make_astro_zip(n)
+            mix = dict(language_mix(files))
+            for lang, target in ASTRO_LANGUAGE_MIX.items():
+                self.assertEqual(
+                    round(mix.get(lang, 0.0), 1),
+                    target,
+                    f"{lang} at n={n}: got {mix.get(lang, 0.0):.3f}%",
+                )
+            extras = {lang: share for lang, share in mix.items() if lang not in ASTRO_LANGUAGE_MIX}
+            for lang, share in extras.items():
+                self.assertLess(share, 0.05, f"unexpected {lang} {share:.2f}% at n={n}")
+
+    def test_astro_corpus_sends_fast_and_stays_byte_exact(self):
+        from tests.benchmark import make_astro_zip
+
+        zip_bytes, expected = make_astro_zip(400)
+        result = self.deploy(zip_bytes)
+        remote = self.remote_files()
+
+        self.assertEqual(result.total_files, len(expected))
+        self.assertLess(result.api_requests, 45, "send used too many API requests")
+        self.assertEqual(self.backend.limiter.rejections, 0)
+        self.assertGreater(result.inlined, len(expected) - 30)
+        self.assertLess(self.backend.stats.max_request_bytes, 6 * 1024 * 1024)
+        for path, data in expected.items():
+            self.assertEqual(remote[path], data, f"content mismatch for {path}")
+
+
+class TestAdaptiveTreeSend(DeployTestCase):
+    def test_oversized_tree_is_split_instead_of_crashing(self):
+        """A 413 from GitHub must split the chunk and finish the send."""
+        self.backend.max_body_bytes = 50_000
+        files = {
+            f"src/mod{i:03d}.ts": (f"export const n = {i};\n" + "export const s = 'xxxx';\n" * 30).encode()
+            for i in range(80)
+        }
+        result = self.deploy(build_zip(files))
+        remote = self.remote_files()
+        self.assertEqual(len(remote), 80)
+        self.assertGreaterEqual(result.tree_calls, 2)
+        for path, data in files.items():
+            self.assertEqual(remote[path], data)
+
+    def test_pack_tree_items_stays_within_budget(self):
+        items = [
+            {"path": f"src/m{i:04d}.ts", "mode": "100644", "type": "blob", "content": "x" * 8000}
+            for i in range(50)
+        ]
+        chunks = app.pack_tree_items(items, max_entries=400, max_bytes=100_000)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            payload = app.encode_json({"tree": chunk, "base_tree": "a" * 40})
+            self.assertLessEqual(len(payload), 100_000 + 2048)
+            self.assertLessEqual(len(chunk), 400)
+        self.assertEqual(sum(len(c) for c in chunks), 50)
+
+
 class TestLocalHelpers(unittest.TestCase):
     def test_git_blob_sha_matches_git(self):
         # `printf 'hello' | git hash-object --stdin` -> b6fc4c62...

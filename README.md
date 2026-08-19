@@ -75,8 +75,8 @@ Two things worth reading twice:
 
 Source-heavy repositories are the best case, because almost everything is text and
 therefore inlines. Benchmarked with `--profile astro`, whose fixture is generated to match
-a real Astro site's language breakdown (TypeScript 92.5%, CSS 4.9%, Astro 2.3%, other
-0.3%) and includes an oversized generated `.ts` bundle plus binary assets under `public/`:
+a real Astro site's language breakdown (TypeScript 92.2%, CSS 4.9%, Astro 2.3%, other
+0.6%) and includes an oversized generated `.ts` bundle plus binary assets under `public/`:
 
 ```
 scenario                                  files       time   requests     ok
@@ -108,8 +108,10 @@ both errors compound. Measured on 3.1 MB of CJK content:
 | before | 6.84 MB |
 | after (UTF-8 body, byte-accurate sizing) | **2.79 MB** |
 
-Both the Python and browser versions now send compact UTF-8 and budget chunks by real
-byte length. `tests/test_deploy.py` and `tests/test_browser.mjs` assert the bound.
+Both the Python and browser versions now send compact UTF-8 and budget chunks by the
+real JSON byte length. If GitHub still rejects a tree POST as too large, the chunk is
+split and retried so the send finishes instead of crashing. `tests/test_deploy.py` and
+`tests/test_browser.mjs` assert the bound.
 
 Numbers are latency-simulated rather than measured against github.com; what they capture
 is the shape of the work — how many round trips, and whether the rate limit is tripped —
@@ -233,7 +235,7 @@ flowchart TD
 Individually:
 
 ```bash
-python3 tests/test_deploy.py               # Python correctness (21 tests)
+python3 tests/test_deploy.py               # Python correctness (25 tests)
 node tests/test_browser.mjs                # browser end-to-end (needs: npm i --no-save jszip)
 python3 tests/benchmark.py                 # head-to-head benchmark (generic web project)
 python3 tests/benchmark.py --profile astro # benchmark an Astro/TypeScript corpus

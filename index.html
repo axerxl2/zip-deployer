@@ -166,7 +166,6 @@
         const CONFIG = {
             maxTreeEntries: 400,               // entries per POST /git/trees
             maxTreeBytes: 3 * 1024 * 1024,     // serialized payload budget per tree call
-            jsonEscapeHeadroom: 1.15,          // allowance for JSON escaping
             maxInlineBytes: 1024 * 1024,       // larger text files go via blob
             blobHardLimit: 100 * 1024 * 1024,  // GitHub's blob ceiling
             workers: 12,                       // parallel blob uploads
@@ -195,7 +194,9 @@
             const time = new Date().toLocaleTimeString();
             const color = { error: 'text-red-400', success: 'text-emerald-400', warn: 'text-yellow-400' }[type] || 'text-slate-300';
             const safe = String(message).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-            logWindow.innerHTML += `\n<span class="text-slate-500">[${time}]</span> <span class="${color}">${safe}</span>`;
+            // insertAdjacentHTML avoids re-parsing the whole log on every line,
+            // which is what made the UI hitch during a 3,000-file send.
+            logWindow.insertAdjacentHTML('beforeend', `\n<span class="text-slate-500">[${time}]</span> <span class="${color}">${safe}</span>`);
             logWindow.scrollTop = logWindow.scrollHeight;
         }
 
@@ -288,13 +289,14 @@
         // ------------------------------------------------------------------
         // Content classification and encoding
         // ------------------------------------------------------------------
-        const strictDecoder = new TextDecoder('utf-8', { fatal: true });
-
         function decodeIfText(bytes) {
             if (bytes.length > CONFIG.maxInlineBytes) return null;
-            for (let i = 0; i < bytes.length; i++) if (bytes[i] === 0) return null;
+            // A shared fatal TextDecoder can be left unusable after a binary
+            // file throws; construct a fresh one so a .webp in public/ cannot
+            // force every later .ts file down the slow blob path.
+            if (bytes.includes(0)) return null;
             try {
-                return strictDecoder.decode(bytes);
+                return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
             } catch (e) {
                 return null;
             }
@@ -352,6 +354,7 @@
         }
 
         const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const yieldToUi = () => new Promise((resolve) => setTimeout(resolve, 0));
 
         // ------------------------------------------------------------------
         // GitHub client
@@ -480,6 +483,7 @@
                     mode: (item.entry.unixPermissions && (item.entry.unixPermissions & 0o111)) ? '100755' : '100644'
                 });
                 done++;
+                if (done % 32 === 0) await yieldToUi();
                 if (done % 100 === 0 || done === entries.length) {
                     setProgress(done / entries.length, 'Reading and hashing archive...', `${done} / ${entries.length}`);
                 }
@@ -540,35 +544,61 @@
             return todo.length;
         }
 
-        async function buildTree(gh, items, baseTree, onProgress) {
+        function packTreeItems(items) {
+            // Pack from the real UTF-8 JSON size so a TypeScript-heavy send
+            // fills each request without going over and crashing mid-deploy.
             const chunks = [];
             let current = [];
-            let bytes = 0;
+            let bytes = 96;
             for (const item of items) {
-                // Measure UTF-8 bytes, not string length: `.length` counts
-                // UTF-16 units, so CJK and emoji would be undercounted and the
-                // payload could come out far larger than the budget intends.
-                const contentBytes = item.content ? utf8Length(item.content) : 0;
-                const cost = Math.round(contentBytes * CONFIG.jsonEscapeHeadroom) + item.path.length + 96;
+                const cost = utf8Length(JSON.stringify(item)) + 1;
                 if (current.length && (current.length >= CONFIG.maxTreeEntries || bytes + cost > CONFIG.maxTreeBytes)) {
                     chunks.push(current);
                     current = [];
-                    bytes = 0;
+                    bytes = 96;
                 }
                 current.push(item);
                 bytes += cost;
             }
             if (current.length) chunks.push(current);
+            return chunks;
+        }
 
-            let treeSha = baseTree;
-            for (let i = 0; i < chunks.length; i++) {
-                const payload = { tree: chunks[i] };
-                if (treeSha) payload.base_tree = treeSha;
+        function isPayloadTooLarge(error) {
+            const msg = String(error && error.message || '').toLowerCase();
+            return / 413 |too large|request entity|payload|size limit|too big/.test(msg);
+        }
+
+        async function postTreeChunk(gh, chunk, baseTree) {
+            try {
+                const payload = { tree: chunk };
+                if (baseTree) payload.base_tree = baseTree;
                 const response = await gh.call('/git/trees', 'POST', payload);
-                treeSha = response.sha;
+                return { sha: response.sha, calls: 1 };
+            } catch (error) {
+                if (chunk.length > 1 && isPayloadTooLarge(error)) {
+                    const mid = Math.max(1, chunk.length >> 1);
+                    log(`Tree chunk of ${chunk.length} was too large — splitting into ${mid} + ${chunk.length - mid}.`, 'warn');
+                    const first = await postTreeChunk(gh, chunk.slice(0, mid), baseTree);
+                    const second = await postTreeChunk(gh, chunk.slice(mid), first.sha);
+                    return { sha: second.sha, calls: first.calls + second.calls };
+                }
+                throw error;
+            }
+        }
+
+        async function buildTree(gh, items, baseTree, onProgress) {
+            const chunks = packTreeItems(items);
+            let treeSha = baseTree;
+            let calls = 0;
+            for (let i = 0; i < chunks.length; i++) {
+                await yieldToUi();
+                const posted = await postTreeChunk(gh, chunks[i], treeSha);
+                treeSha = posted.sha;
+                calls += posted.calls;
                 onProgress(i + 1, chunks.length);
             }
-            return { treeSha, calls: chunks.length };
+            return { treeSha, calls };
         }
 
         async function verifyTree(gh, treeSha, expected) {
@@ -632,11 +662,13 @@
             const inline = [];
             const viaBlob = [];
             let reused = 0;
-            for (const file of changed) {
+            for (let i = 0; i < changed.length; i++) {
+                const file = changed[i];
                 if (existing.shas.has(file.sha)) { viaBlob.push(file); reused++; continue; }
                 const text = decodeIfText(file.data);
                 if (text !== null) { file.text = text; inline.push(file); }
                 else viaBlob.push(file);
+                if (i % 64 === 0) await yieldToUi();
             }
             const needsUpload = viaBlob.filter((f) => !existing.shas.has(f.sha));
             log(`Plan: ${inline.length} inlined into tree, ${needsUpload.length} uploaded as blobs, ` +
