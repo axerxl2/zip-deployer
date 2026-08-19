@@ -126,6 +126,7 @@ function makeSandbox({ withSubtle = true } = {}) {
     getElement('opt-verify').checked = true;
     getElement('opt-strip').checked = false;
     getElement('opt-prune').checked = false;
+    getElement('opt-bulk').checked = true;
 
     const alerts = [];
     const sandbox = {
@@ -313,7 +314,35 @@ async function main() {
         check(run7.log.includes('Verification passed'), 'mixed TS/binary send verified clean');
         check(mixedStats.max_request_bytes < 6 * 1024 * 1024, 'mixed send stayed inside the payload budget');
 
-        // --- 9. generated TypeScript bundle stays on the fast path -----------
+        // --- 9. binary-heavy archives use GraphQL batches --------------------
+        console.log('\nbrowser: binary-heavy archives are bulk-staged');
+        const binaries = {};
+        for (let i = 0; i < 1000; i++) {
+            const data = Buffer.alloc(128, i % 251);
+            data[0] = 0;
+            data.writeUInt32BE(i, 1);
+            binaries[`assets/chunk${String(i).padStart(4, '0')}.bin`] = data;
+        }
+        const statsBeforeBinary = await remoteStats('octocat', 'binary-bulk');
+        const run9 = await runDeploy({
+            zipBuffer: await buildZip(binaries), owner: 'octocat', repo: 'binary-bulk'
+        });
+        const binaryFiles = await remoteFiles('octocat', 'binary-bulk');
+        const binaryStats = await remoteStats('octocat', 'binary-bulk');
+        const graphqlDelta = (binaryStats.by_endpoint['POST /graphql'] || 0) -
+            (statsBeforeBinary.by_endpoint['POST /graphql'] || 0);
+        const blobDelta = (binaryStats.by_endpoint['POST /git/blobs'] || 0) -
+            (statsBeforeBinary.by_endpoint['POST /git/blobs'] || 0);
+        const binaryReq = Number((run9.log.match(/using (\d+) API requests/) || [])[1] || Infinity);
+        check(binaryFiles.size >= 1000, `all 1000 binary files deployed (got ${binaryFiles.size - 1})`);
+        check(binaryReq < 40, `1000 binaries cost ${binaryReq} requests, not ~1000`);
+        check(graphqlDelta === 10, '1000 binaries were packed into 10 GraphQL mutations');
+        check(blobDelta === 0, 'bulk binary send used zero per-file blob POSTs');
+        check(binaryFiles.get('assets/chunk0999.bin')?.bytes.equals(binaries['assets/chunk0999.bin']),
+            'bulk-staged binary content is byte-exact');
+        check(run9.log.includes('Verification passed'), 'bulk binary send verified clean');
+
+        // --- 10. generated TypeScript bundle stays on the fast path ----------
         console.log('\nbrowser: generated .ts bundle stays inline');
         const fat = {
             'src/generated/api-types.ts': Buffer.alloc(1_200_000, 97),

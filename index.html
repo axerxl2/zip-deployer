@@ -109,6 +109,10 @@
                             <input type="checkbox" id="opt-prune" class="mt-0.5 rounded border-slate-300 text-red-600 focus:ring-red-500">
                             <span><span class="font-medium">Delete files missing from the ZIP</span><br><span class="text-slate-400 text-xs">Makes the branch mirror the archive exactly. Destructive.</span></span>
                         </label>
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input type="checkbox" id="opt-bulk" checked class="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500">
+                            <span><span class="font-medium">Batch binary files (fast)</span><br><span class="text-slate-400 text-xs">Uses short-lived staging branches to avoid one API call per binary.</span></span>
+                        </label>
                     </div>
                 </div>
                 <hr class="border-slate-100">
@@ -150,8 +154,8 @@
             </div>
         </div>
         <p class="text-center text-xs text-slate-400">
-            Uses GitHub's Git Data API. Text files ride inline inside tree objects, so thousands of
-            files cost a handful of requests instead of one request each.
+            Uses GitHub's Git Data and GraphQL APIs. Text rides inline and binary files are bulked,
+            so thousands of files cost a handful of requests instead of one request each.
         </p>
     </main>
     <script>
@@ -170,12 +174,19 @@
             // Only real binaries take the slow blob path.
             maxInlineBytes: 3 * 1024 * 1024 - 256 * 1024,
             blobHardLimit: 100 * 1024 * 1024,  // GitHub's blob ceiling
-            workers: 12,                       // parallel blob uploads
+            maxBulkEntries: 100,               // binary files per GraphQL mutation
+            maxBulkBytes: 3 * 1024 * 1024,     // bounded base64 mutation payload
+            minBulkFiles: 8,                   // pooled REST is cheaper below this
+            workers: 12,                       // small blob-upload fallback
             pointsPerMin: 900,                 // GitHub's secondary rate limit
             safety: 0.85,                      // margin for client/server clock skew
             maxRetries: 6
         };
         const SKIP_PATTERNS = ['__MACOSX', '.DS_Store', 'Thumbs.db'];
+        const GRAPHQL_COMMIT_MUTATION = `
+            mutation ZipDeployerStage($input: CreateCommitOnBranchInput!) {
+                createCommitOnBranch(input: $input) { commit { oid } }
+            }`;
 
         const el = (id) => document.getElementById(id);
         const fileInput = el('zip-file');
@@ -420,6 +431,56 @@
                 }
                 throw lastError || new Error(`Request failed: ${path}`);
             }
+
+            async graphql(query, variables) {
+                const url = 'https://api.github.com/graphql';
+                let lastError = null;
+                for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
+                    await this.budget.spend(5);
+                    let res;
+                    try {
+                        res = await fetch(url, {
+                            method: 'POST',
+                            headers: {
+                                Authorization: `Bearer ${this.token}`,
+                                Accept: 'application/vnd.github+json',
+                                'X-GitHub-Api-Version': '2022-11-28',
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({ query, variables })
+                        });
+                    } catch (networkError) {
+                        lastError = networkError;
+                        if (attempt === CONFIG.maxRetries) throw networkError;
+                        await sleep(backoffMs(attempt));
+                        continue;
+                    }
+                    this.requests++;
+                    if (res.ok) {
+                        const payload = await res.json();
+                        if (payload.errors && payload.errors.length) {
+                            const message = payload.errors.map((e) => e.message || String(e)).join(' | ');
+                            throw new Error(`GitHub GraphQL 422 on /graphql: ${message}`);
+                        }
+                        return payload.data || {};
+                    }
+                    const text = await res.text();
+                    let message = text;
+                    try { message = (JSON.parse(text).message) || text; } catch (e) { /* keep raw */ }
+                    const retryable = res.status === 429 || res.status >= 500 ||
+                        (res.status === 403 && /rate limit|abuse/i.test(message));
+                    if (!retryable || attempt === CONFIG.maxRetries) {
+                        throw new Error(`GitHub GraphQL ${res.status} on /graphql: ${message}`);
+                    }
+                    const retryAfter = parseFloat(res.headers.get('retry-after'));
+                    const delay = Number.isFinite(retryAfter)
+                        ? Math.min(retryAfter * 1000 + 1000, 120000)
+                        : backoffMs(attempt);
+                    log(`${res.status} on /graphql — retrying in ${(delay / 1000).toFixed(1)}s`, 'warn');
+                    await sleep(delay);
+                }
+                throw lastError || new Error('GraphQL request failed');
+            }
         }
 
         function backoffMs(attempt) {
@@ -546,6 +607,123 @@
             return todo.length;
         }
 
+        function packBulkAdditions(additions) {
+            const chunks = [];
+            let current = [];
+            let bytes = 2048; // mutation query, variables, and JSON wrappers
+            for (const item of additions) {
+                const cost = utf8Length(JSON.stringify(item)) + 2;
+                if (current.length && (current.length >= CONFIG.maxBulkEntries ||
+                    bytes + cost > CONFIG.maxBulkBytes)) {
+                    chunks.push(current);
+                    current = [];
+                    bytes = 2048;
+                }
+                current.push(item);
+                bytes += cost;
+            }
+            if (current.length) chunks.push(current);
+            return chunks;
+        }
+
+        function randomStageBranch() {
+            const bytes = new Uint8Array(8);
+            crypto.getRandomValues(bytes);
+            const suffix = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+            return `zip-deployer/stage-${Date.now().toString(36)}-${suffix}`;
+        }
+
+        async function recoverStagedCommit(gh, branch, expectedHead) {
+            try {
+                const ref = await gh.call(`/git/ref/heads/${branch}`);
+                const current = ref.object.sha;
+                if (current === expectedHead) return null;
+                const commit = await gh.call(`/git/commits/${current}`);
+                const parents = (commit.parents || []).map((p) => p.sha);
+                return parents.length === 1 && parents[0] === expectedHead ? current : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        async function stageBulkChunk(gh, additions, branch, expectedHead, batchNumber) {
+            const variables = {
+                input: {
+                    branch: {
+                        repositoryNameWithOwner: `${gh.owner}/${gh.repo}`,
+                        branchName: branch
+                    },
+                    expectedHeadOid: expectedHead,
+                    message: { headline: `ZIP deploy staging batch ${batchNumber}` },
+                    fileChanges: { additions }
+                }
+            };
+            try {
+                const data = await gh.graphql(GRAPHQL_COMMIT_MUTATION, variables);
+                return { head: data.createCommitOnBranch.commit.oid, calls: 1 };
+            } catch (error) {
+                const recovered = await recoverStagedCommit(gh, branch, expectedHead);
+                if (recovered) {
+                    log('Recovered a completed bulk batch after a lost response.', 'warn');
+                    return { head: recovered, calls: 1 };
+                }
+                if (additions.length > 1 && isPayloadTooLarge(error)) {
+                    const mid = additions.length >> 1;
+                    log(`Bulk batch of ${additions.length} files was too large — splitting into ${mid} + ${additions.length - mid}.`, 'warn');
+                    const first = await stageBulkChunk(gh, additions.slice(0, mid), branch, expectedHead, batchNumber);
+                    const second = await stageBulkChunk(gh, additions.slice(mid), branch, first.head, batchNumber);
+                    return { head: second.head, calls: first.calls + second.calls };
+                }
+                throw error;
+            }
+        }
+
+        async function stageBlobsBulk(gh, files, parentCommit, onProgress) {
+            const unique = new Map();
+            for (const file of files) if (!unique.has(file.sha)) unique.set(file.sha, file);
+            const todo = [...unique.values()];
+            if (todo.length < CONFIG.minBulkFiles) return null;
+
+            const additions = todo.map((file) => ({ path: file.path, contents: toBase64(file.data) }));
+            const chunks = packBulkAdditions(additions);
+            const branch = randomStageBranch();
+            log(`Bulk-staging ${todo.length} binary/large blob(s) in ${chunks.length} GraphQL request(s)...`);
+            try {
+                await gh.call('/git/refs', 'POST', {
+                    ref: `refs/heads/${branch}`,
+                    sha: parentCommit
+                });
+                let head = parentCommit;
+                let calls = 0;
+                let completed = 0;
+                for (let i = 0; i < chunks.length; i++) {
+                    const staged = await stageBulkChunk(gh, chunks[i], branch, head, i + 1);
+                    head = staged.head;
+                    calls += staged.calls;
+                    completed += chunks[i].length;
+                    onProgress(completed, todo.length);
+                    if (chunks.length > 1) log(`  -> bulk batch ${i + 1}/${chunks.length} (${chunks[i].length} files)`);
+                    await yieldToUi();
+                }
+                const commit = await gh.call(`/git/commits/${head}`);
+                log(`Bulk-staged ${todo.length} blob(s) in ${calls} request(s).`);
+                return { treeSha: commit.tree.sha, shas: new Set(unique.keys()), branch, calls, count: todo.length };
+            } catch (error) {
+                log(`Bulk binary API unavailable (${error.message}); falling back to pooled blob uploads.`, 'warn');
+                try { await gh.call(`/git/refs/heads/${branch}`, 'DELETE'); } catch (e) { /* best effort */ }
+                return null;
+            }
+        }
+
+        async function cleanupStage(gh, stage) {
+            if (!stage) return;
+            try {
+                await gh.call(`/git/refs/heads/${stage.branch}`, 'DELETE');
+            } catch (error) {
+                log(`Could not remove temporary branch '${stage.branch}': ${error.message}`, 'warn');
+            }
+        }
+
         function packTreeItems(items) {
             // Pack from the real UTF-8 JSON size so a TypeScript-heavy send
             // fills each request without going over and crashing mid-deploy.
@@ -617,9 +795,22 @@
         }
 
         async function deploy(options) {
-            const { token, owner, repo, branch, file, message, skipUnchanged, verify, prune, stripRoot } = options;
             const started = Date.now();
-            const gh = new GitHub(token, owner, repo);
+            const gh = new GitHub(options.token, options.owner, options.repo);
+            const staging = { current: null };
+            let result;
+            try {
+                result = await deployWithClient(options, gh, started, staging);
+            } finally {
+                await cleanupStage(gh, staging.current);
+            }
+            result.requests = gh.requests;
+            result.duration = Date.now() - started;
+            return result;
+        }
+
+        async function deployWithClient(options, gh, started, staging) {
+            const { branch, file, message, skipUnchanged, verify, prune, stripRoot, bulk } = options;
 
             log('Reading ZIP file in memory...');
             const files = await readArchive(file, stripRoot);
@@ -676,12 +867,28 @@
             log(`Plan: ${inline.length} inlined into tree, ${needsUpload.length} uploaded as blobs, ` +
                 `${reused} reused, ${unchanged} unchanged.`);
 
+            let uploadedCount = 0;
+            let bulkShas = new Set();
+            let treeBase = treeSha;
             if (needsUpload.length) {
-                setProgress(0.15, 'Uploading binary files...', `0 / ${needsUpload.length}`);
-                await uploadBlobs(gh, needsUpload, (done, total) => {
-                    setProgress(0.15 + 0.35 * (done / total), 'Uploading binary files...', `${done} / ${total}`);
-                });
-                log(`Uploaded ${needsUpload.length} blob(s).`);
+                setProgress(0.15, 'Bulk-staging binary files...', `0 / ${needsUpload.length}`);
+                const bulkStage = bulk ? await stageBlobsBulk(gh, needsUpload, commitSha, (done, total) => {
+                    setProgress(0.15 + 0.30 * (done / total), 'Bulk-staging binary files...', `${done} / ${total}`);
+                }) : null;
+                staging.current = bulkStage;
+                if (bulkStage) {
+                    treeBase = bulkStage.treeSha;
+                    bulkShas = bulkStage.shas;
+                    uploadedCount += bulkStage.count;
+                }
+                const remaining = needsUpload.filter((f) => !bulkShas.has(f.sha));
+                if (remaining.length) {
+                    setProgress(0.15, 'Uploading remaining binary files...', `0 / ${remaining.length}`);
+                    uploadedCount += await uploadBlobs(gh, remaining, (done, total) => {
+                        setProgress(0.15 + 0.30 * (done / total), 'Uploading remaining binary files...', `${done} / ${total}`);
+                    });
+                }
+                log(`Uploaded ${uploadedCount} unique blob(s).`);
             }
 
             const treeItems = inline.map((f) => ({ path: f.path, mode: f.mode, type: 'blob', content: f.text }))
@@ -689,7 +896,7 @@
                 .concat(deletions);
 
             setProgress(0.5, 'Writing the git tree...', '');
-            const { treeSha: newTree, calls } = await buildTree(gh, treeItems, treeSha, (done, total) => {
+            const { treeSha: newTree, calls } = await buildTree(gh, treeItems, treeBase, (done, total) => {
                 setProgress(0.5 + 0.35 * (done / total), 'Writing the git tree...', `${done} / ${total} requests`);
             });
             log(`Tree written in ${calls} request(s).`);
@@ -716,7 +923,7 @@
 
             setProgress(0.93, 'Creating commit...');
             const commitMessage = message || `Deploy ${changed.length} file(s) from ZIP\n\n` +
-                `${inline.length} inlined, ${needsUpload.length} uploaded, ${unchanged} unchanged.`;
+                `${inline.length} inlined, ${uploadedCount} uploaded, ${unchanged} unchanged.`;
             const commit = await gh.call('/git/commits', 'POST', {
                 message: commitMessage,
                 tree: finalTree,
@@ -731,7 +938,7 @@
                 files: files.length,
                 unchanged,
                 inlined: inline.length,
-                uploaded: needsUpload.length,
+                uploaded: uploadedCount,
                 requests: gh.requests,
                 duration: Date.now() - started,
                 commit: commit.sha,
@@ -804,7 +1011,8 @@
                     skipUnchanged: el('opt-skip').checked,
                     verify: el('opt-verify').checked,
                     prune: el('opt-prune').checked,
-                    stripRoot: el('opt-strip').checked
+                    stripRoot: el('opt-strip').checked,
+                    bulk: el('opt-bulk').checked
                 });
 
                 const rate = result.files / (result.duration / 1000);
