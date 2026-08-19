@@ -313,6 +313,19 @@ async function main() {
         check(run7.log.includes('Verification passed'), 'mixed TS/binary send verified clean');
         check(mixedStats.max_request_bytes < 6 * 1024 * 1024, 'mixed send stayed inside the payload budget');
 
+        // --- 9. generated TypeScript bundle stays on the fast path -----------
+        console.log('\nbrowser: generated .ts bundle stays inline');
+        const fat = {
+            'src/generated/api-types.ts': Buffer.alloc(1_200_000, 97),
+            'src/lib/ok.ts': Buffer.from('export const ok = 1;\n')
+        };
+        const run8 = await runDeploy({ zipBuffer: await buildZip(fat), owner: 'octocat', repo: 'fatties' });
+        const fatFiles = await remoteFiles('octocat', 'fatties');
+        const fatReq = Number((run8.log.match(/using (\d+) API requests/) || [])[1] || Infinity);
+        check(fatFiles.get('src/generated/api-types.ts')?.bytes.length === 1_200_000, '1.2 MB .ts round-tripped');
+        check(fatReq < 15, `1.2 MB .ts + 1 small file cost ${fatReq} requests, not a blob POST each`);
+        check(run8.log.includes('Verification passed'), 'large .ts send verified clean');
+
         console.log(`\n${checks - failures}/${checks} checks passed`);
         return failures === 0 ? 0 : 1;
     } finally {

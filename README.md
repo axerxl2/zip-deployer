@@ -216,8 +216,8 @@ flowchart TD
    bit is preserved. Each file gets the SHA-1 git itself would assign.
 2. **Diff.** The branch tree is read once; files whose path and SHA already match are
    skipped entirely.
-3. **Split.** Valid UTF-8 goes inline into tree entries; binaries and files above 1 MB go
-   the blob route, deduplicated by content SHA.
+3. **Split.** TypeScript, CSS, Astro and other valid UTF-8 ride inline — even a
+   generated file of a couple of MB. Only real binaries take the blob route.
 4. **Write.** Trees are written in chunks bounded by entry count and payload size, each
    chained onto the previous via `base_tree`.
 5. **Verify.** The resulting tree is read back and compared against the locally computed
@@ -235,7 +235,7 @@ flowchart TD
 Individually:
 
 ```bash
-python3 tests/test_deploy.py               # Python correctness (25 tests)
+python3 tests/test_deploy.py               # Python correctness (26 tests)
 node tests/test_browser.mjs                # browser end-to-end (needs: npm i --no-save jszip)
 python3 tests/benchmark.py                 # head-to-head benchmark (generic web project)
 python3 tests/benchmark.py --profile astro # benchmark an Astro/TypeScript corpus

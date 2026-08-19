@@ -65,8 +65,22 @@ POINTS_READ = 1               # GET / HEAD / OPTIONS
 
 MAX_TREE_ENTRIES = 400        # entries per POST /git/trees call
 MAX_TREE_BYTES = 3 * 1024 * 1024   # serialized payload budget per tree call
-MAX_INLINE_BYTES = 1024 * 1024     # bigger text files go the blob route
+# Any valid UTF-8 that fits in one tree POST rides inline — including the
+# generated .ts bundles in a TypeScript/Astro site. Only real binaries
+# (and text bigger than a whole request) take the slow blob path.
+MAX_INLINE_BYTES = MAX_TREE_BYTES - 256 * 1024
 BLOB_HARD_LIMIT = 100 * 1024 * 1024  # GitHub rejects blobs above ~100 MB
+
+# Source files from a typical GitHub language bar. These must never fall
+# through to one-POST-per-file just because a generated file is > 1 MB.
+FAST_TEXT_EXTS = (
+    ".ts", ".tsx", ".mts", ".cts",
+    ".js", ".jsx", ".mjs", ".cjs",
+    ".css", ".scss", ".sass", ".less",
+    ".astro", ".vue", ".svelte",
+    ".json", ".md", ".mdx", ".svg",
+    ".html", ".htm", ".txt", ".yml", ".yaml",
+)
 
 MODE_FILE = "100644"
 MODE_EXEC = "100755"
@@ -189,8 +203,13 @@ def git_blob_sha(data: bytes) -> str:
     return h.hexdigest()
 
 
-def is_inlineable(data: bytes) -> bool:
-    """True when the bytes can safely ride inside a tree entry's `content`."""
+def is_inlineable(data: bytes, path: str = "") -> bool:
+    """True when the bytes can safely ride inside a tree entry's `content`.
+
+    TypeScript / CSS / Astro stay on this fast path even when a generated
+    file is a couple of megabytes. Only NUL-bytes, invalid UTF-8, or a
+    file bigger than one whole tree request go via blob.
+    """
     if len(data) > MAX_INLINE_BYTES:
         return False
     if b"\x00" in data:
@@ -850,7 +869,7 @@ class Deployer:
                 # The object already exists in this repo, reference it directly.
                 blob_entries.append(entry)
                 result.blobs_reused += 1
-            elif self.inline and is_inlineable(entry.data):
+            elif self.inline and is_inlineable(entry.data, entry.path):
                 inline_entries.append(entry)
             else:
                 blob_entries.append(entry)
@@ -1020,7 +1039,7 @@ def main(argv=None) -> int:
     )
 
     if args.dry_run:
-        inlineable = sum(1 for f in files if is_inlineable(f.data))
+        inlineable = sum(1 for f in files if is_inlineable(f.data, f.path))
         est_trees = max(1, (len(files) + MAX_TREE_ENTRIES - 1) // MAX_TREE_ENTRIES)
         log(f"Dry run: {inlineable} inlineable, {len(files) - inlineable} need blob uploads")
         log(f"Dry run: roughly {est_trees + len(files) - inlineable + 4} API requests")

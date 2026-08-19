@@ -295,16 +295,24 @@ class TestPayloadBounds(DeployTestCase):
         for path, expected in files.items():
             self.assertEqual(remote[path], expected, f"CJK content mangled for {path}")
 
-    def test_large_text_file_round_trips_via_blob(self):
-        # Above MAX_INLINE_BYTES a text file must switch to a blob upload —
-        # lockfiles, bundles and source maps in real projects land here.
+    def test_generated_typescript_bundle_stays_on_the_fast_path(self):
+        # A 1.5 MB generated .ts file is typical in an Astro/TS repo.
+        # It must ride inline — one extra blob POST is the old "low" path.
         big = ("export const data = 'x';\n" * 60000).encode()
-        self.assertGreater(len(big), app.MAX_INLINE_BYTES)
+        self.assertGreater(len(big), 1024 * 1024)
+        self.assertLess(len(big), app.MAX_INLINE_BYTES)
         files = {"src/generated/api-types.ts": big, "small.ts": b"export const a = 1;\n"}
         result = self.deploy(build_zip(files))
-        self.assertEqual(result.blobs_uploaded, 1)   # only the big one
-        self.assertEqual(result.inlined, 1)
+        self.assertEqual(result.blobs_uploaded, 0)
+        self.assertEqual(result.inlined, 2)
         self.assertEqual(self.remote_files()["src/generated/api-types.ts"], big)
+
+    def test_text_bigger_than_a_tree_request_still_round_trips(self):
+        huge = b"export const x = 1;\n" * ((app.MAX_INLINE_BYTES // 20) + 200)
+        self.assertFalse(app.is_inlineable(huge, "src/huge.ts"))
+        result = self.deploy(build_zip({"src/huge.ts": huge}))
+        self.assertEqual(result.blobs_uploaded, 1)
+        self.assertEqual(self.remote_files()["src/huge.ts"], huge)
 
 
 class TestAstroProfile(DeployTestCase):
@@ -336,7 +344,17 @@ class TestAstroProfile(DeployTestCase):
         self.assertEqual(result.total_files, len(expected))
         self.assertLess(result.api_requests, 45, "send used too many API requests")
         self.assertEqual(self.backend.limiter.rejections, 0)
-        self.assertGreater(result.inlined, len(expected) - 30)
+        source = [p for p in expected if p.endswith((".ts", ".tsx", ".css", ".astro"))]
+        binaries = [p for p, data in expected.items() if not app.is_inlineable(data, p)]
+        self.assertTrue(source)
+        for path in source:
+            self.assertTrue(
+                app.is_inlineable(expected[path], path),
+                f"{path} ({len(expected[path])} bytes) must stay on the fast path",
+            )
+        self.assertEqual(result.blobs_uploaded, len(binaries))
+        self.assertTrue(all(p.endswith(".webp") for p in binaries), binaries)
+        self.assertEqual(result.inlined, len(expected) - len(binaries))
         self.assertLess(self.backend.stats.max_request_bytes, 6 * 1024 * 1024)
         for path, data in expected.items():
             self.assertEqual(remote[path], data, f"content mismatch for {path}")

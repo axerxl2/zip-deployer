@@ -166,7 +166,9 @@
         const CONFIG = {
             maxTreeEntries: 400,               // entries per POST /git/trees
             maxTreeBytes: 3 * 1024 * 1024,     // serialized payload budget per tree call
-            maxInlineBytes: 1024 * 1024,       // larger text files go via blob
+            // Text (TS/CSS/Astro) rides inline up to one full tree request.
+            // Only real binaries take the slow blob path.
+            maxInlineBytes: 3 * 1024 * 1024 - 256 * 1024,
             blobHardLimit: 100 * 1024 * 1024,  // GitHub's blob ceiling
             workers: 12,                       // parallel blob uploads
             pointsPerMin: 900,                 // GitHub's secondary rate limit
