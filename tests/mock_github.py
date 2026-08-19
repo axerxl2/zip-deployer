@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-A local stand-in for GitHub's Git Data API, used to test and benchmark the
-deployer without touching a real repository (or a real access token).
+A local stand-in for GitHub's Git Data and GraphQL commit APIs, used to test
+and benchmark the deployer without touching a real repository or token.
 
 It is deliberately strict, so that passing against it means something:
 
@@ -10,6 +10,8 @@ It is deliberately strict, so that passing against it means something:
   and fails verification.
 * Tree entries must supply exactly one of `sha` or `content`, and a `sha` that
   was never written is rejected with 422, just like the real API.
+* GraphQL createCommitOnBranch supports strict base64 binary additions,
+  expected-head checks, and real temporary branch updates.
 * The documented secondary rate limit is enforced: 900 points per minute,
   5 points per write, 1 per read, replying 403 + Retry-After when exceeded.
 * Per-request latency is simulated, including a per-entry cost for large tree
@@ -220,6 +222,9 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in parsed.path.split("/") if p]
         backend = self.backend
 
+        # GraphQL is rooted at /graphql rather than /repos/{owner}/{repo}.
+        is_graphql = parts == ["graphql"]
+
         # The _debug endpoint is a test helper, not part of GitHub's API: it is
         # exempt from rate limiting and fault injection so that assertions can
         # always read the repository state back.
@@ -247,6 +252,21 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if is_graphql:
+            if method != "POST":
+                self._error(405, "Method Not Allowed")
+                return
+            if backend.should_fail():
+                backend.sleep(backend.latency)
+                self._error(500, "Injected transient server error")
+                return
+            backend.stats.start("POST /graphql")
+            try:
+                self._route_graphql(backend)
+            finally:
+                backend.stats.finish()
+            return
+
         if len(parts) < 3 or parts[0] != "repos":
             self._error(404, "Not Found")
             return
@@ -269,6 +289,93 @@ class Handler(BaseHTTPRequestHandler):
             backend.stats.finish()
 
     # -- routes ------------------------------------------------------------
+
+    def _route_graphql(self, backend: MockGitHub):
+        """Implement createCommitOnBranch with binary-safe base64 additions."""
+        body = self._body()
+        query = body.get("query", "")
+        variables = body.get("variables", {})
+        if "createCommitOnBranch" not in query:
+            self._send(200, {"errors": [{"message": "Unsupported GraphQL operation"}]})
+            return
+
+        input_data = variables.get("input", {})
+        branch_data = input_data.get("branch", {})
+        name_with_owner = branch_data.get("repositoryNameWithOwner", "")
+        if "/" not in name_with_owner:
+            self._send(200, {"errors": [{"message": "Invalid repositoryNameWithOwner"}]})
+            return
+        owner, name = name_with_owner.split("/", 1)
+        branch = branch_data.get("branchName", "")
+        expected = input_data.get("expectedHeadOid", "")
+        changes = input_data.get("fileChanges") or {}
+        additions = changes.get("additions") or []
+        deletions = changes.get("deletions") or []
+        repo = backend.repo(owner, name)
+
+        paths = [item.get("path") for item in additions + deletions]
+        if len(paths) != len(set(paths)):
+            self._send(200, {"errors": [{"message": "File paths must be unique"}]})
+            return
+
+        with repo.lock:
+            current = repo.refs.get(branch)
+            if current != expected:
+                self._send(200, {"errors": [{
+                    "message": f'Expected branch to point to "{expected}" but it did not.'
+                }]})
+                return
+            parent = repo.commits.get(current or "")
+            if not parent:
+                self._send(200, {"errors": [{"message": "Expected head commit does not exist"}]})
+                return
+            base_tree = parent.get("tree", {}).get("sha", "")
+            entries = dict(repo.trees.get(base_tree, {}))
+
+            for item in deletions:
+                path = item.get("path")
+                if path not in entries:
+                    self._send(200, {"errors": [{"message": f"Cannot delete missing path {path}"}]})
+                    return
+                del entries[path]
+
+            for item in additions:
+                path = item.get("path")
+                try:
+                    # validate=True catches malformed padding/alphabet just as
+                    # GitHub's Base64String scalar does.
+                    data = base64.b64decode(item.get("contents", ""), validate=True)
+                except Exception:
+                    self._send(200, {"errors": [{"message": f"Invalid base64 for {path}"}]})
+                    return
+                sha = repo.put_blob(data)
+                # createCommitOnBranch additions are regular files. The
+                # deployer corrects executable modes in its final REST tree.
+                entries[path] = ("100644", sha)
+
+            tree_sha = repo.put_tree(entries)
+            commit_body = {
+                "message": (input_data.get("message") or {}).get("headline", ""),
+                "tree": tree_sha,
+                "parents": [current],
+            }
+            commit_sha = hashlib.sha1(
+                (json.dumps(commit_body, sort_keys=True) + str(time.time())).encode()
+            ).hexdigest()
+            repo.commits[commit_sha] = {
+                "sha": commit_sha,
+                "message": commit_body["message"],
+                "tree": {"sha": tree_sha},
+                "parents": [{"sha": current}],
+            }
+            repo.refs[branch] = commit_sha
+
+        total_bytes = sum(len(item.get("contents", "")) * 3 // 4 for item in additions)
+        backend.sleep(
+            backend.write_latency,
+            extra=len(additions) * backend.per_entry_latency + total_bytes / (20 * 1024 * 1024),
+        )
+        self._send(200, {"data": {"createCommitOnBranch": {"commit": {"oid": commit_sha}}}})
 
     def _route(self, method, repo: Repo, rest, query, backend):
         # GET /git/ref/heads/{branch}
@@ -312,6 +419,40 @@ class Handler(BaseHTTPRequestHandler):
                 # Non-recursive: only top level; enough for our purposes.
                 entries = [e for e in entries if "/" not in e["path"]]
             self._send(200, {"sha": rest[2], "tree": entries, "truncated": len(entries) > 100000})
+            return
+
+        # POST /git/refs  (create a temporary branch)
+        if method == "POST" and rest[:2] == ["git", "refs"] and len(rest) == 2:
+            body = self._body()
+            ref_name = body.get("ref", "")
+            prefix = "refs/heads/"
+            if not ref_name.startswith(prefix):
+                self._error(422, "Only branch refs are supported")
+                return
+            branch = ref_name[len(prefix):]
+            sha = body.get("sha", "")
+            backend.sleep(backend.write_latency)
+            with repo.lock:
+                if branch in repo.refs:
+                    self._error(422, "Reference already exists")
+                    return
+                if sha not in repo.commits:
+                    self._error(422, "Object does not exist")
+                    return
+                repo.refs[branch] = sha
+            self._send(201, {"ref": ref_name, "object": {"sha": sha, "type": "commit"}})
+            return
+
+        # DELETE /git/refs/heads/{branch}
+        if method == "DELETE" and rest[:2] == ["git", "refs"] and len(rest) >= 4:
+            branch = "/".join(rest[3:])
+            backend.sleep(backend.write_latency)
+            with repo.lock:
+                if branch not in repo.refs:
+                    self._error(422, "Reference does not exist")
+                    return
+                del repo.refs[branch]
+            self._send(204, None)
             return
 
         # POST /git/blobs
@@ -484,6 +625,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         self._dispatch("PUT")
+
+    def do_DELETE(self):
+        self._dispatch("DELETE")
 
 
 def serve(backend: MockGitHub, host: str = "127.0.0.1", port: int = 0):

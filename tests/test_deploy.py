@@ -61,7 +61,7 @@ class DeployTestCase(unittest.TestCase):
 
     def deploy(self, zip_bytes: bytes, branch="main", **kwargs):
         deploy_kwargs = {
-            k: kwargs.pop(k) for k in ("inline", "verify", "prune") if k in kwargs
+            k: kwargs.pop(k) for k in ("inline", "bulk", "verify", "prune") if k in kwargs
         }
         files = app.read_zip(zip_bytes, workers=4, strip_root=kwargs.pop("strip_root", False))
         client = app.GitHubClient(
@@ -157,6 +157,22 @@ class TestContentFidelity(DeployTestCase):
         # png, random bin and the NUL-containing file cannot be inlined
         self.assertEqual(result.blobs_uploaded, 3)
         self.assertEqual(result.inlined, len(self.TRICKY) - 3)
+
+    def test_bulk_binary_send_preserves_executable_mode(self):
+        files = {f"bin/tool{i}": b"\x00\xff" + bytes([i]) * 64 for i in range(8)}
+        result = self.deploy(build_zip(files, exec_paths={"bin/tool3"}))
+        self.assertEqual(result.bulk_batches, 1)
+        modes = self.remote_modes()
+        self.assertEqual(modes["bin/tool3"], "100755")
+        self.assertEqual(modes["bin/tool4"], "100644")
+
+    def test_bulk_can_be_disabled_for_compatibility(self):
+        files = {f"assets/a{i}.bin": b"\x00\xff" + bytes([i]) * 32 for i in range(8)}
+        result = self.deploy(build_zip(files), bulk=False)
+        self.assertEqual(result.bulk_batches, 0)
+        self.assertEqual(self.backend.stats.by_endpoint.get("POST /graphql", 0), 0)
+        self.assertEqual(self.backend.stats.by_endpoint.get("POST /git/blobs"), 8)
+        self.assertEqual(self.remote_files(), files)
 
 
 class TestIncrementalDeploys(DeployTestCase):
@@ -272,6 +288,32 @@ class TestRateLimitCompliance(DeployTestCase):
         self.assertLess(self.backend.stats.total, 60, "used too many API requests")
         self.assertEqual(len(self.remote_files()), 3000)
 
+    def test_three_thousand_binary_files_are_batched(self):
+        """Binary-heavy archives must also finish in tens, not thousands, of POSTs."""
+        files = {
+            f"assets/chunk{i:04d}.bin": b"\x00\xffbinary" + i.to_bytes(4, "big") + bytes([i % 251]) * 96
+            for i in range(3000)
+        }
+        result = self.deploy(build_zip(files))
+
+        self.assertEqual(result.blobs_uploaded, 3000)
+        self.assertEqual(result.bulk_batches, 30)
+        self.assertEqual(self.backend.stats.by_endpoint.get("POST /git/blobs", 0), 0)
+        self.assertEqual(self.backend.stats.by_endpoint.get("POST /graphql"), 30)
+        self.assertEqual(self.backend.limiter.rejections, 0, "hit GitHub's secondary rate limit")
+        self.assertLess(result.api_requests, 50, "binary deploy used too many API requests")
+        remote = self.remote_files()
+        self.assertEqual(len(remote), 3000)
+        for path in ("assets/chunk0000.bin", "assets/chunk1499.bin", "assets/chunk2999.bin"):
+            self.assertEqual(remote[path], files[path])
+
+        # Staging commits never become target history, and their random refs
+        # are removed even though their objects remain available to Git.
+        repo = self.backend.repo("octocat", "hello-world")
+        self.assertEqual(set(repo.refs), {"main"})
+        head = repo.commits[repo.refs["main"]]
+        self.assertEqual(len(head["parents"]), 1)
+
 
 class TestPayloadBounds(DeployTestCase):
     """Packing many files per request must not produce oversized payloads."""
@@ -361,6 +403,18 @@ class TestAstroProfile(DeployTestCase):
 
 
 class TestAdaptiveTreeSend(DeployTestCase):
+    def test_oversized_bulk_mutation_is_split_instead_of_crashing(self):
+        self.backend.max_body_bytes = 20_000
+        files = {
+            f"assets/blob{i:03d}.bin": b"\x00\xff" + i.to_bytes(2, "big") + bytes([i]) * 1000
+            for i in range(80)
+        }
+        result = self.deploy(build_zip(files))
+        self.assertGreater(result.bulk_batches, 1)
+        self.assertEqual(self.backend.stats.by_endpoint.get("POST /git/blobs", 0), 0)
+        self.assertEqual(self.remote_files(), files)
+        self.assertEqual(set(self.backend.repo("octocat", "hello-world").refs), {"main"})
+
     def test_oversized_tree_is_split_instead_of_crashing(self):
         """A 413 from GitHub must split the chunk and finish the send."""
         self.backend.max_body_bytes = 50_000
@@ -398,6 +452,16 @@ class TestLocalHelpers(unittest.TestCase):
         # empty blob is a well-known constant
         self.assertEqual(
             app.git_blob_sha(b""), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        )
+
+    def test_graphql_endpoint_derivation(self):
+        self.assertEqual(
+            app.GitHubClient._derive_graphql_base("https://api.github.com"),
+            "https://api.github.com/graphql",
+        )
+        self.assertEqual(
+            app.GitHubClient._derive_graphql_base("https://github.example/api/v3"),
+            "https://github.example/api/graphql",
         )
 
     def test_inlineable_classification(self):

@@ -19,12 +19,13 @@ This implementation instead:
      collapse from ~3,000 POSTs to ~10.
   2. Computes each file's git blob SHA-1 locally and diffs it against the
      branch's existing tree, so unchanged files cost zero requests.
-  3. Uploads only what genuinely needs a blob (binary / oversized files) using
-     a streaming worker pool with connection reuse — no batch barriers.
-  4. Paces itself against the documented point budget and retries with
-     exponential backoff + jitter, honouring `Retry-After`.
-  5. Verifies the final tree server-side and auto-repairs any mismatch before
-     the commit is created.
+  3. Packs binary / oversized files into createCommitOnBranch GraphQL
+     mutations on a disposable branch (up to 100 files per request), then
+     folds that tree into the one real target commit.
+  4. Keeps a pooled per-blob fallback for small sends and servers where the
+     GraphQL mutation or temporary refs are unavailable.
+  5. Paces itself against the documented point budget, retries with backoff,
+     and verifies the final tree before the commit is created.
 
 Usage:
     python app.py                       # interactive
@@ -66,10 +67,25 @@ POINTS_READ = 1               # GET / HEAD / OPTIONS
 MAX_TREE_ENTRIES = 400        # entries per POST /git/trees call
 MAX_TREE_BYTES = 3 * 1024 * 1024   # serialized payload budget per tree call
 # Any valid UTF-8 that fits in one tree POST rides inline — including the
-# generated .ts bundles in a TypeScript/Astro site. Only real binaries
-# (and text bigger than a whole request) take the slow blob path.
+# generated .ts bundles in a TypeScript/Astro site.
 MAX_INLINE_BYTES = MAX_TREE_BYTES - 256 * 1024
 BLOB_HARD_LIMIT = 100 * 1024 * 1024  # GitHub rejects blobs above ~100 MB
+
+# GitHub's createCommitOnBranch GraphQL mutation accepts binary additions as
+# base64. We use it as a bulk object writer on a disposable branch, then make
+# the one real deploy commit with the resulting tree. The 100-entry cap is
+# deliberately conservative; the byte cap keeps requests proxy-friendly.
+MAX_BULK_ENTRIES = 100
+MAX_BULK_BYTES = 3 * 1024 * 1024
+MIN_BULK_FILES = 8
+
+GRAPHQL_COMMIT_MUTATION = """
+mutation ZipDeployerStage($input: CreateCommitOnBranchInput!) {
+  createCommitOnBranch(input: $input) {
+    commit { oid }
+  }
+}
+"""
 
 # Source files from a typical GitHub language bar. These must never fall
 # through to one-POST-per-file just because a generated file is > 1 MB.
@@ -96,6 +112,28 @@ def encode_json(data) -> bytes:
     return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
 
+def _pack_json_items(
+    items: list[dict], max_entries: int, max_bytes: int, wrapper_bytes: int
+) -> list[list[dict]]:
+    """Pack JSON objects by their real UTF-8 wire size."""
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    current_bytes = wrapper_bytes
+    for item in items:
+        item_bytes = len(encode_json(item)) + 2
+        if current and (
+            len(current) >= max_entries or current_bytes + item_bytes > max_bytes
+        ):
+            chunks.append(current)
+            current = []
+            current_bytes = wrapper_bytes
+        current.append(item)
+        current_bytes += item_bytes
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def pack_tree_items(
     tree_items: list[dict],
     max_entries: int = MAX_TREE_ENTRIES,
@@ -107,22 +145,18 @@ def pack_tree_items(
     which either blows the payload (413 / timeout) or wastes a round trip.
     Measuring the real UTF-8 JSON keeps each POST just under the budget.
     """
-    chunks: list[list[dict]] = []
-    current: list[dict] = []
-    current_bytes = _TREE_WRAPPER_BYTES
-    for item in tree_items:
-        item_bytes = len(encode_json(item)) + 2  # comma + space in the array
-        if current and (
-            len(current) >= max_entries or current_bytes + item_bytes > max_bytes
-        ):
-            chunks.append(current)
-            current = []
-            current_bytes = _TREE_WRAPPER_BYTES
-        current.append(item)
-        current_bytes += item_bytes
-    if current:
-        chunks.append(current)
-    return chunks
+    return _pack_json_items(tree_items, max_entries, max_bytes, _TREE_WRAPPER_BYTES)
+
+
+def pack_bulk_additions(
+    additions: list[dict],
+    max_entries: int = MAX_BULK_ENTRIES,
+    max_bytes: int = MAX_BULK_BYTES,
+) -> list[list[dict]]:
+    """Pack base64 GraphQL additions into bounded mutation payloads."""
+    # Query, variables, branch/message fields, and JSON wrappers take less than
+    # 1 KiB. Reserve 2 KiB so the actual request remains below max_bytes.
+    return _pack_json_items(additions, max_entries, max_bytes, 2048)
 
 
 def is_payload_too_large(exc: "GitHubError") -> bool:
@@ -421,6 +455,7 @@ class GitHubClient:
         owner: str,
         repo: str,
         api_base: str = DEFAULT_API_BASE,
+        graphql_base: str | None = None,
         workers: int = DEFAULT_WORKERS,
         max_retries: int = 6,
         points_per_min: int = DEFAULT_POINTS_PER_MIN,
@@ -430,6 +465,7 @@ class GitHubClient:
         self.owner = owner
         self.repo = repo
         self.api_base = api_base.rstrip("/")
+        self.graphql_base = (graphql_base or self._derive_graphql_base(self.api_base)).rstrip("/")
         self.max_retries = max_retries
         self.timeout = timeout
         self.transport = make_transport(workers)
@@ -437,18 +473,50 @@ class GitHubClient:
         self.requests_made = 0
         self._counter_lock = threading.Lock()
 
+    @staticmethod
+    def _derive_graphql_base(api_base: str) -> str:
+        """Derive the GraphQL endpoint for github.com or GitHub Enterprise."""
+        base = api_base.rstrip("/")
+        if base.endswith("/api/v3"):
+            return base[:-3] + "/graphql"
+        return base + "/graphql"
+
     def _headers(self) -> dict:
         return {
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "Content-Type": "application/json",
-            "User-Agent": "github-zip-deployer/2.0",
+            "User-Agent": "github-zip-deployer/3.0",
             "Connection": "keep-alive",
         }
 
     def request(self, method: str, path: str, data=None, allow_404: bool = False):
         url = f"{self.api_base}/repos/{self.owner}/{self.repo}{path}"
+        return self._request_url(method, url, data, allow_404=allow_404, label=path)
+
+    def graphql(self, query: str, variables: dict):
+        """Run a GraphQL operation and turn GraphQL-level errors into GitHubError."""
+        payload = self._request_url(
+            "POST",
+            self.graphql_base,
+            {"query": query, "variables": variables},
+            label="/graphql",
+        )
+        errors = (payload or {}).get("errors") or []
+        if errors:
+            message = " | ".join(str(item.get("message", item)) for item in errors)
+            raise GitHubError(422, message, "/graphql")
+        return (payload or {}).get("data") or {}
+
+    def _request_url(
+        self,
+        method: str,
+        url: str,
+        data=None,
+        allow_404: bool = False,
+        label: str = "",
+    ):
         # ensure_ascii=False keeps non-ASCII as compact UTF-8 instead of
         # expanding every character to a 6-byte \\uXXXX escape, which on a
         # unicode-heavy repository inflates the payload by 1.5x or more.
@@ -466,7 +534,7 @@ class GitHubClient:
             except Exception as exc:  # network hiccup: retry
                 last_error = exc
                 if attempt == self.max_retries:
-                    raise GitHubError(0, f"network error: {exc}", path) from exc
+                    raise GitHubError(0, f"network error: {exc}", label) from exc
                 time.sleep(self._backoff(attempt))
                 continue
 
@@ -483,13 +551,13 @@ class GitHubClient:
                 resp.status == 403 and _SECONDARY_RE.search(message or "")
             )
             if not retryable or attempt == self.max_retries:
-                raise GitHubError(resp.status, message, path)
+                raise GitHubError(resp.status, message, label)
 
             delay = self._retry_delay(resp, attempt)
-            log(f"{resp.status} on {path} — backing off {delay:.1f}s ({message[:90]})", "warn")
+            log(f"{resp.status} on {label} — backing off {delay:.1f}s ({message[:90]})", "warn")
             time.sleep(delay)
 
-        raise GitHubError(0, f"exhausted retries: {last_error}", path)
+        raise GitHubError(0, f"exhausted retries: {last_error}", label)
 
     @staticmethod
     def _error_message(resp: Response) -> str:
@@ -635,6 +703,7 @@ class DeployResult:
         self.inlined = 0
         self.blobs_uploaded = 0
         self.blobs_reused = 0
+        self.bulk_batches = 0
         self.tree_calls = 0
         self.bytes_total = 0
         self.commit_sha = ""
@@ -649,6 +718,7 @@ class DeployResult:
             "inlined": self.inlined,
             "blobs_uploaded": self.blobs_uploaded,
             "blobs_reused": self.blobs_reused,
+            "bulk_batches": self.bulk_batches,
             "tree_calls": self.tree_calls,
             "bytes_total": self.bytes_total,
             "commit_sha": self.commit_sha,
@@ -665,6 +735,7 @@ class Deployer:
         branch: str = "main",
         workers: int = DEFAULT_WORKERS,
         inline: bool = True,
+        bulk: bool = True,
         verify: bool = True,
         prune: bool = False,
     ):
@@ -672,8 +743,10 @@ class Deployer:
         self.branch = branch
         self.workers = workers
         self.inline = inline
+        self.bulk = bulk
         self.verify = verify
         self.prune = prune
+        self._staging_branches: list[str] = []
 
     # -- branch resolution -------------------------------------------------
 
@@ -719,6 +792,145 @@ class Deployer:
                 by_path[item["path"]] = item["sha"]
                 known.add(item["sha"])
         return by_path, known, bool(data.get("truncated"))
+
+    # -- binary bulk staging ----------------------------------------------
+
+    def _cleanup_staging_branches(self) -> None:
+        """Best-effort removal of disposable GraphQL staging refs."""
+        while self._staging_branches:
+            branch = self._staging_branches.pop()
+            try:
+                self.gh.request("DELETE", f"/git/refs/heads/{branch}")
+            except Exception as exc:
+                log(f"Could not remove temporary branch '{branch}': {exc}", "warn")
+
+    def _recover_staged_commit(self, branch: str, expected_head: str) -> str | None:
+        """Recover when a mutation succeeded but its HTTP response was lost."""
+        try:
+            ref = self.gh.request("GET", f"/git/ref/heads/{branch}")
+            current = ref["object"]["sha"]
+            if current == expected_head:
+                return None
+            commit = self.gh.request("GET", f"/git/commits/{current}")
+            parents = [p.get("sha") for p in commit.get("parents", [])]
+            return current if parents == [expected_head] else None
+        except Exception:
+            return None
+
+    def _stage_bulk_chunk(
+        self,
+        additions: list[dict],
+        branch: str,
+        expected_head: str,
+        batch_number: int,
+    ) -> tuple[str, int]:
+        """Apply one GraphQL batch, splitting a rejected oversized payload."""
+        variables = {
+            "input": {
+                "branch": {
+                    "repositoryNameWithOwner": f"{self.gh.owner}/{self.gh.repo}",
+                    "branchName": branch,
+                },
+                "expectedHeadOid": expected_head,
+                "message": {"headline": f"ZIP deploy staging batch {batch_number}"},
+                "fileChanges": {"additions": additions},
+            }
+        }
+        try:
+            data = self.gh.graphql(GRAPHQL_COMMIT_MUTATION, variables)
+            return data["createCommitOnBranch"]["commit"]["oid"], 1
+        except GitHubError as exc:
+            # Mutations are retried after transport failures. If the first
+            # request actually landed, its random branch can only have moved
+            # by this operation, so accepting its child commit is idempotent.
+            recovered = self._recover_staged_commit(branch, expected_head)
+            if recovered:
+                log("Recovered a completed bulk batch after a lost response.", "warn")
+                return recovered, 1
+            if len(additions) > 1 and is_payload_too_large(exc):
+                mid = len(additions) // 2
+                log(
+                    f"Bulk batch of {len(additions)} files was too large — "
+                    f"splitting into {mid} + {len(additions) - mid}.",
+                    "warn",
+                )
+                first, calls1 = self._stage_bulk_chunk(
+                    additions[:mid], branch, expected_head, batch_number
+                )
+                second, calls2 = self._stage_bulk_chunk(
+                    additions[mid:], branch, first, batch_number
+                )
+                return second, calls1 + calls2
+            raise
+
+    def stage_blobs_bulk(
+        self,
+        entries: list[FileEntry],
+        parent_commit: str,
+        result: DeployResult,
+    ) -> tuple[str | None, set[str]]:
+        """Write many binary blobs through batched GraphQL mutations.
+
+        createCommitOnBranch accepts RFC-4648 base64 (including arbitrary
+        binary data), unlike REST tree `content`. Batches are committed to a
+        random disposable branch. Its final tree is then used to build the
+        single real deploy commit, so the target branch still gains exactly
+        one commit and executable modes can still be corrected by the tree API.
+        """
+        if not self.bulk:
+            return None, set()
+
+        unique: dict[str, FileEntry] = {}
+        for entry in entries:
+            unique.setdefault(entry.sha, entry)
+        todo = list(unique.values())
+        if len(todo) < MIN_BULK_FILES:
+            return None, set()
+
+        additions = [
+            {"path": entry.path, "contents": base64.b64encode(entry.data).decode("ascii")}
+            for entry in todo
+        ]
+        chunks = pack_bulk_additions(additions)
+        branch = (
+            f"zip-deployer/stage-{os.getpid()}-"
+            f"{random.getrandbits(48):012x}"
+        )
+        log(
+            f"Bulk-staging {len(todo)} binary/large blob(s) in "
+            f"{len(chunks)} GraphQL request(s)..."
+        )
+
+        try:
+            self.gh.request(
+                "POST", "/git/refs", {"ref": f"refs/heads/{branch}", "sha": parent_commit}
+            )
+            self._staging_branches.append(branch)
+            head = parent_commit
+            calls = 0
+            for index, chunk in enumerate(chunks, 1):
+                head, used = self._stage_bulk_chunk(chunk, branch, head, index)
+                calls += used
+                if len(chunks) > 1:
+                    log(f"  -> bulk batch {index}/{len(chunks)} ({len(chunk)} files)")
+            commit = self.gh.request("GET", f"/git/commits/{head}")
+        except GitHubError as exc:
+            log(
+                f"Bulk binary API unavailable ({exc}); falling back to pooled blob uploads.",
+                "warn",
+            )
+            if branch in self._staging_branches:
+                try:
+                    self.gh.request("DELETE", f"/git/refs/heads/{branch}")
+                except Exception:
+                    pass
+                self._staging_branches.remove(branch)
+            return None, set()
+
+        result.bulk_batches += calls
+        result.blobs_uploaded += len(todo)
+        log(f"Bulk-staged {len(todo)} blob(s) in {calls} request(s).")
+        return commit["tree"]["sha"], set(unique)
 
     # -- blob uploads ------------------------------------------------------
 
@@ -815,6 +1027,18 @@ class Deployer:
     # -- main flow ---------------------------------------------------------
 
     def deploy(self, files: list[FileEntry], message: str | None = None) -> DeployResult:
+        """Deploy and always remove any disposable bulk-staging refs."""
+        started = time.monotonic()
+        result = None
+        try:
+            result = self._deploy(files, message)
+        finally:
+            self._cleanup_staging_branches()
+        result.duration = time.monotonic() - started
+        result.api_requests = self.gh.requests_made
+        return result
+
+    def _deploy(self, files: list[FileEntry], message: str | None = None) -> DeployResult:
         result = DeployResult()
         result.total_files = len(files)
         result.bytes_total = sum(f.size for f in files)
@@ -882,7 +1106,12 @@ class Deployer:
             f"{result.unchanged} unchanged."
         )
 
-        self.upload_blobs(needs_upload, result)
+        # Binary bytes cannot be represented by REST tree `content`. For a
+        # handful of them pooled blob POSTs are cheapest; for a large set the
+        # GraphQL staging branch packs up to 100 binary files into each write.
+        bulk_tree, bulk_shas = self.stage_blobs_bulk(needs_upload, parent_commit, result)
+        remaining_uploads = [e for e in needs_upload if e.sha not in bulk_shas]
+        self.upload_blobs(remaining_uploads, result)
         result.inlined = len(inline_entries)
 
         tree_items: list[dict] = []
@@ -901,7 +1130,10 @@ class Deployer:
             )
         tree_items.extend(deletions)
 
-        tree_sha = self.build_tree(tree_items, base_tree, result)
+        # A successful bulk stage already contains its binary additions on top
+        # of the original tree. Chaining the regular tree entries onto it folds
+        # text, reused objects, deletions, and executable modes into one tree.
+        tree_sha = self.build_tree(tree_items, bulk_tree or base_tree, result)
 
         if self.verify:
             log("Verifying tree contents against locally computed SHAs...")
@@ -985,11 +1217,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--message", "-m", help="commit message")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="parallel connections")
     parser.add_argument("--api-base", default=os.environ.get("GITHUB_API_BASE", DEFAULT_API_BASE),
-                        help="API base URL (for GitHub Enterprise or testing)")
+                        help="REST API base URL (for GitHub Enterprise or testing)")
+    parser.add_argument("--graphql-base", default=os.environ.get("GITHUB_GRAPHQL_BASE"),
+                        help="GraphQL endpoint (derived from --api-base when omitted)")
     parser.add_argument("--points-per-min", type=int, default=DEFAULT_POINTS_PER_MIN,
                         help="secondary rate-limit budget to stay under")
     parser.add_argument("--no-inline", action="store_true",
-                        help="disable inline tree content (slow path, one blob per file)")
+                        help="disable inline tree content")
+    parser.add_argument("--no-bulk", action="store_true",
+                        help="disable batched GraphQL uploads for binary files")
     parser.add_argument("--no-verify", action="store_true", help="skip server-side verification")
     parser.add_argument("--prune", action="store_true",
                         help="delete repository files that are absent from the ZIP")
@@ -1040,11 +1276,24 @@ def main(argv=None) -> int:
 
     if args.dry_run:
         inlineable = sum(1 for f in files if is_inlineable(f.data, f.path))
+        binary = [f for f in files if not is_inlineable(f.data, f.path)]
+        unique_binary = {f.sha: f for f in binary}
         est_trees = max(1, (len(files) + MAX_TREE_ENTRIES - 1) // MAX_TREE_ENTRIES)
-        log(f"Dry run: {inlineable} inlineable, {len(files) - inlineable} need blob uploads")
-        log(f"Dry run: roughly {est_trees + len(files) - inlineable + 4} API requests")
+        if not args.no_bulk and len(unique_binary) >= MIN_BULK_FILES:
+            additions = [
+                {"path": f.path, "contents": base64.b64encode(f.data).decode("ascii")}
+                for f in unique_binary.values()
+            ]
+            bulk_batches = len(pack_bulk_additions(additions))
+            est_requests = est_trees + bulk_batches + 8
+        else:
+            bulk_batches = 0
+            est_requests = est_trees + len(unique_binary) + 4
+        log(f"Dry run: {inlineable} inlineable, {len(binary)} binary/large")
+        log(f"Dry run: roughly {est_requests} API requests ({bulk_batches} bulk batches)")
         if args.json:
-            print(json.dumps({"files": len(files), "bytes": total_bytes, "inlineable": inlineable}, indent=2))
+            print(json.dumps({"files": len(files), "bytes": total_bytes,
+                              "inlineable": inlineable, "bulk_batches": bulk_batches}, indent=2))
         return 0
 
     client = GitHubClient(
@@ -1052,6 +1301,7 @@ def main(argv=None) -> int:
         owner=owner,
         repo=repo,
         api_base=args.api_base,
+        graphql_base=args.graphql_base,
         workers=args.workers,
         points_per_min=args.points_per_min,
     )
@@ -1060,6 +1310,7 @@ def main(argv=None) -> int:
         branch=branch,
         workers=args.workers,
         inline=not args.no_inline,
+        bulk=not args.no_bulk,
         verify=not args.no_verify,
         prune=args.prune,
     )

@@ -10,6 +10,7 @@ rewritten to point at the mock.
 
     python tests/benchmark.py                 # full run, 3000 files
     python tests/benchmark.py --files 500     # quicker
+    python tests/benchmark.py --profile binary --skip-legacy
     python tests/benchmark.py --skip-legacy   # only measure the new engine
 
 Numbers are latency-simulated, not measurements against github.com; the point
@@ -290,6 +291,28 @@ def language_mix(files: dict[str, bytes]) -> list[tuple[str, float]]:
     return sorted(((k, v * 100 / grand) for k, v in totals.items()), key=lambda kv: -kv[1])
 
 
+def make_binary_zip(n_files: int, seed: int = 7331) -> tuple[bytes, dict[str, bytes]]:
+    """A binary-heavy game/media-style project with unique small assets."""
+    rng = random.Random(seed)
+    files: dict[str, bytes] = {}
+    extensions = ("bin", "png", "webp", "wasm", "dat")
+    for i in range(n_files):
+        size = rng.randint(512, 4096)
+        # NUL + invalid UTF-8 makes classification unambiguously binary. The
+        # index in the header also guarantees every git blob is unique.
+        data = b"\x00\xffZIPBIN" + i.to_bytes(4, "big") + bytes(
+            rng.getrandbits(8) for _ in range(size)
+        )
+        ext = extensions[i % len(extensions)]
+        files[f"assets/{ext}/chunk{i:05d}.{ext}"] = data
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for path, data in files.items():
+            zf.writestr(path, data)
+    return buffer.getvalue(), files
+
+
 def make_project_zip(n_files: int, seed: int = 1337) -> tuple[bytes, dict[str, bytes]]:
     """A realistic front-end-ish project: mostly small text, some binaries."""
     rng = random.Random(seed)
@@ -457,8 +480,8 @@ def fmt_duration(seconds: float) -> str:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--files", type=int, default=3000, help="files in the benchmark ZIP")
-    parser.add_argument("--profile", choices=("generic", "astro"), default="generic",
-                        help="corpus shape: a generic web project, or an Astro/TypeScript site")
+    parser.add_argument("--profile", choices=("generic", "astro", "binary"), default="generic",
+                        help="corpus shape: generic web, Astro/TypeScript, or all-binary assets")
     parser.add_argument("--legacy-files", type=int, default=200,
                         help="subset size for the legacy run (it is too slow to run in full)")
     parser.add_argument("--skip-legacy", action="store_true")
@@ -469,7 +492,12 @@ def main():
     rows = []
     tmpdir = Path(tempfile.mkdtemp(prefix="zipbench-"))
     try:
-        builder = make_astro_zip if args.profile == "astro" else make_project_zip
+        builders = {
+            "generic": make_project_zip,
+            "astro": make_astro_zip,
+            "binary": make_binary_zip,
+        }
+        builder = builders[args.profile]
         print(f"Building a {args.files}-file {args.profile} project ZIP...")
         zip_bytes, expected = builder(args.files)
         zip_path = tmpdir / "project.zip"
@@ -520,8 +548,11 @@ def main():
         # ---- 3. New engine, one file changed ------------------------------
         print(f"\n[3/5] New engine — one file changed out of {args.files}")
         changed = dict(expected)
-        victim = sorted(p for p in expected if p.endswith((".js", ".ts")))[0]
-        changed[victim] = b"// touched by the benchmark\n"
+        source_files = sorted(p for p in expected if p.endswith((".js", ".ts")))
+        victim = source_files[0] if source_files else sorted(expected)[0]
+        replacement = (b"// touched by the benchmark\n" if source_files
+                       else b"\x00\xfftouched by the benchmark\n")
+        changed[victim] = replacement
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for path, data in changed.items():
@@ -530,7 +561,7 @@ def main():
         changed_zip.write_bytes(buffer.getvalue())
         elapsed3, result3 = run_new(bench, changed_zip, "bench")
         after = bench.remote_files(repo="bench")
-        ok3 = (after.get(victim) == b"// touched by the benchmark\n"
+        ok3 = (after.get(victim) == replacement
                and result3.unchanged == len(expected) - 1)
         print(f"      {fmt_duration(elapsed3)}, {result3.api_requests} API requests, "
               f"{result3.unchanged} unchanged, changed file correct: {ok3}")
