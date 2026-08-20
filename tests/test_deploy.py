@@ -298,10 +298,14 @@ class TestRateLimitCompliance(DeployTestCase):
 
         self.assertEqual(result.blobs_uploaded, 3000)
         self.assertEqual(result.bulk_batches, 30)
-        self.assertEqual(self.backend.stats.by_endpoint.get("POST /git/blobs", 0), 0)
+        # One 12-worker REST wave runs alongside the five GraphQL chains; the
+        # remainder stays batched so hybrid mode cannot exhaust point budget.
+        rest_posts = self.backend.stats.by_endpoint.get("POST /git/blobs", 0)
+        self.assertGreater(rest_posts, 0)
+        self.assertLessEqual(rest_posts, 12)
         self.assertEqual(self.backend.stats.by_endpoint.get("POST /graphql"), 30)
         self.assertEqual(self.backend.limiter.rejections, 0, "hit GitHub's secondary rate limit")
-        self.assertLess(result.api_requests, 50, "binary deploy used too many API requests")
+        self.assertLess(result.api_requests, 75, "binary deploy used too many API requests")
         remote = self.remote_files()
         self.assertEqual(len(remote), 3000)
         for path in ("assets/chunk0000.bin", "assets/chunk1499.bin", "assets/chunk2999.bin"):
@@ -313,6 +317,46 @@ class TestRateLimitCompliance(DeployTestCase):
         self.assertEqual(set(repo.refs), {"main"})
         head = repo.commits[repo.refs["main"]]
         self.assertEqual(len(head["parents"]), 1)
+
+
+class TestParallelBulkStaging(DeployTestCase):
+    def test_parallel_branches_are_byte_exact_and_disposable(self):
+        # Multi-megabyte, music-like assets force many byte-bounded batches.
+        # Per-byte processing makes overlap observable without a long test.
+        self.backend.graphql_per_byte = 1 / (30 * 1024 * 1024)
+        self.backend.upload_bytes_per_sec = 100 * 1024 * 1024
+        files = {
+            f"music/track{i:03d}.png": b"\x89PNG\x00\xff" + i.to_bytes(2, "big") + os.urandom(320 * 1024)
+            for i in range(48)
+        }
+        details = []
+        zip_bytes = build_zip(files)
+        parsed = app.read_zip(zip_bytes, workers=4)
+        client = app.GitHubClient(
+            "test-token", "octocat", "hello-world", api_base=self.base_url,
+            workers=16, points_per_min=100000,
+        )
+        try:
+            deployer = app.Deployer(
+                client, workers=12,
+                progress=lambda _fraction, _label, detail: details.append(detail),
+            )
+            result = deployer.deploy(parsed)
+        finally:
+            client.close()
+
+        self.assertEqual(self.remote_files(), files)
+        self.assertGreaterEqual(self.backend.stats.max_concurrency, 3)
+        self.assertGreaterEqual(result.bulk_batches, app.BULK_STAGING_LANES)
+        self.assertTrue(any("MB" in detail for detail in details), details[-10:])
+
+        repo = self.backend.repo("octocat", "hello-world")
+        self.assertEqual(set(repo.refs), {"main"}, "temporary staging refs leaked")
+        target = repo.commits[repo.refs["main"]]
+        self.assertEqual(len(target["parents"]), 1)
+        # Exactly one commit was appended to the target branch; all staging
+        # commits remain unreachable after their refs are removed.
+        self.assertEqual(repo.commits[target["parents"][0]["sha"]]["parents"], [])
 
 
 class TestPayloadBounds(DeployTestCase):
@@ -403,6 +447,19 @@ class TestAstroProfile(DeployTestCase):
 
 
 class TestAdaptiveTreeSend(DeployTestCase):
+    def test_repeated_502_splits_then_falls_back_only_failed_chunk(self):
+        self.backend.graphql_failures = 20
+        self.backend.graphql_failure_status = 502
+        files = {
+            f"music/fallback{i}.png": b"\x89PNG\x00\xff" + bytes([i]) * 1024
+            for i in range(8)
+        }
+        result = self.deploy(build_zip(files))
+        self.assertEqual(self.remote_files(), files)
+        self.assertEqual(result.blobs_uploaded, 8)
+        self.assertEqual(self.backend.stats.by_endpoint.get("POST /git/blobs"), 8)
+        self.assertEqual(set(self.backend.repo("octocat", "hello-world").refs), {"main"})
+
     def test_oversized_bulk_mutation_is_split_instead_of_crashing(self):
         self.backend.max_body_bytes = 20_000
         files = {

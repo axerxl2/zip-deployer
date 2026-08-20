@@ -68,9 +68,13 @@ async function remoteStats(owner, repo) {
     return res.json();
 }
 
-async function remoteFiles(owner, repo, branch = 'main') {
+async function remoteDebug(owner, repo, branch = 'main') {
     const res = await fetch(`${MOCK_URL}/repos/${owner}/${repo}/_debug/files/${branch}`);
-    const payload = await res.json();
+    return res.json();
+}
+
+async function remoteFiles(owner, repo, branch = 'main') {
+    const payload = await remoteDebug(owner, repo, branch);
     const out = new Map();
     for (const [path, meta] of Object.entries(payload.files)) {
         out.set(path, { bytes: Buffer.from(meta.b64, 'base64'), mode: meta.mode });
@@ -237,6 +241,32 @@ async function main() {
         check(batched.size >= 1000, `all 1000 files deployed (got ${batched.size - 1})`);
         check(requests < 30, `1000 files cost ${requests} API requests, not ~1000`);
 
+        // --- parallel binary staging ---------------------------------------
+        console.log('\nbrowser: parallel binary staging');
+        const music = {};
+        for (let i = 0; i < 60; i++) {
+            const data = Buffer.alloc(256 * 1024, i % 251);
+            Buffer.from(`PNG-${String(i).padStart(4, '0')}\0`).copy(data);
+            music[`music/cover${String(i).padStart(4, '0')}.png`] = data;
+        }
+        const musicRun = await runDeploy({
+            zipBuffer: await buildZip(music), owner: 'octocat', repo: 'music'
+        });
+        const musicFiles = await remoteFiles('octocat', 'music');
+        const musicStats = await remoteStats('octocat', 'music');
+        const musicDebug = await remoteDebug('octocat', 'music');
+        let musicExact = true;
+        for (const [path, expected] of Object.entries(music)) {
+            if (!musicFiles.get(path)?.bytes.equals(expected)) musicExact = false;
+        }
+        check(musicExact, 'parallel-staged binaries are byte exact');
+        check((musicStats.by_endpoint['POST /graphql'] || 0) >= 5,
+            'work was distributed over multiple GraphQL chains');
+        check(musicStats.refs.length === 1 && musicStats.refs[0] === 'main',
+            'all disposable staging refs were removed');
+        check(musicDebug.parents.length === 1, 'target branch received one final deploy commit');
+        check(/MB/.test(musicRun.log), 'binary progress reports uploaded MB');
+
         // --- 3. incremental redeploy ---------------------------------------
         console.log('\nbrowser: incremental redeploy');
         const run3 = await runDeploy({ zipBuffer: manyZip, owner: 'octocat', repo: 'batching' });
@@ -335,9 +365,9 @@ async function main() {
             (statsBeforeBinary.by_endpoint['POST /git/blobs'] || 0);
         const binaryReq = Number((run9.log.match(/using (\d+) API requests/) || [])[1] || Infinity);
         check(binaryFiles.size >= 1000, `all 1000 binary files deployed (got ${binaryFiles.size - 1})`);
-        check(binaryReq < 40, `1000 binaries cost ${binaryReq} requests, not ~1000`);
+        check(binaryReq < 60, `1000 binaries cost ${binaryReq} requests, not ~1000`);
         check(graphqlDelta === 10, '1000 binaries were packed into 10 GraphQL mutations');
-        check(blobDelta === 0, 'bulk binary send used zero per-file blob POSTs');
+        check(blobDelta === 12, '12-worker REST lane ran concurrently with bulk staging');
         check(binaryFiles.get('assets/chunk0999.bin')?.bytes.equals(binaries['assets/chunk0999.bin']),
             'bulk-staged binary content is byte-exact');
         check(run9.log.includes('Verification passed'), 'bulk binary send verified clean');

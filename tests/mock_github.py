@@ -131,6 +131,11 @@ class MockGitHub:
         points_per_min: int = 900,
         fail_every: int = 0,
         max_body_bytes: int = 0,
+        upload_bytes_per_sec: float = 0,
+        graphql_per_byte: float = 1 / (20 * 1024 * 1024),
+        tree_per_byte: float = 0,
+        graphql_failures: int = 0,
+        graphql_failure_status: int = 502,
     ):
         self.repos: dict[str, Repo] = {}
         self.latency = latency
@@ -148,6 +153,22 @@ class MockGitHub:
         # 0 = unlimited. Set to exercise the deployer's split-and-retry path
         # when a tree POST comes in oversized (real GitHub answers 413).
         self.max_body_bytes = max_body_bytes
+        # Wire upload time and server-side byte processing are separate knobs:
+        # real multi-megabyte mutations pay both, unlike the old latency-only
+        # benchmark model.
+        self.upload_bytes_per_sec = upload_bytes_per_sec
+        self.graphql_per_byte = graphql_per_byte
+        self.tree_per_byte = tree_per_byte
+        self.graphql_failures = graphql_failures
+        self.graphql_failure_status = graphql_failure_status
+
+    def consume_graphql_failure(self) -> bool:
+        with self.lock:
+            if self.graphql_failures <= 0:
+                return False
+            self.graphql_failures -= 1
+            self.injected_failures += 1
+            return True
 
     def should_fail(self) -> bool:
         if not self.fail_every:
@@ -201,6 +222,8 @@ class Handler(BaseHTTPRequestHandler):
         self._raw_body = self.rfile.read(length) if length else b""
         if length:
             self.backend.stats.record_body(length)
+            if self.backend.upload_bytes_per_sec > 0:
+                time.sleep(length / self.backend.upload_bytes_per_sec)
 
     def _send(self, status: int, payload, extra_headers: dict | None = None):
         data = json.dumps(payload).encode("utf-8") if payload is not None else b""
@@ -255,6 +278,12 @@ class Handler(BaseHTTPRequestHandler):
         if is_graphql:
             if method != "POST":
                 self._error(405, "Method Not Allowed")
+                return
+            if backend.consume_graphql_failure():
+                backend.stats.start("POST /graphql")
+                backend.sleep(backend.latency)
+                backend.stats.finish()
+                self._error(backend.graphql_failure_status, "Injected GraphQL gateway failure")
                 return
             if backend.should_fail():
                 backend.sleep(backend.latency)
@@ -373,7 +402,8 @@ class Handler(BaseHTTPRequestHandler):
         total_bytes = sum(len(item.get("contents", "")) * 3 // 4 for item in additions)
         backend.sleep(
             backend.write_latency,
-            extra=len(additions) * backend.per_entry_latency + total_bytes / (20 * 1024 * 1024),
+            extra=(len(additions) * backend.per_entry_latency +
+                   total_bytes * backend.graphql_per_byte),
         )
         self._send(200, {"data": {"createCommitOnBranch": {"commit": {"oid": commit_sha}}}})
 
@@ -517,7 +547,13 @@ class Handler(BaseHTTPRequestHandler):
 
                 tree_sha = repo.put_tree(entries)
 
-            backend.sleep(backend.write_latency, extra=len(items) * backend.per_entry_latency)
+            # Server-side tree parsing/writing scales with the JSON body,
+            # including SHA-only binary entries and long paths.
+            tree_bytes = len(getattr(self, "_raw_body", b""))
+            backend.sleep(
+                backend.write_latency,
+                extra=len(items) * backend.per_entry_latency + tree_bytes * backend.tree_per_byte,
+            )
             self._send(
                 201,
                 {
@@ -594,6 +630,8 @@ class Handler(BaseHTTPRequestHandler):
                 "max_request_bytes": backend.stats.max_request_bytes,
                 "by_endpoint": backend.stats.by_endpoint,
                 "rate_limit_rejections": backend.limiter.rejections,
+                "max_concurrency": backend.stats.max_concurrency,
+                "refs": sorted(repo.refs),
             })
             return
 
@@ -608,7 +646,12 @@ class Handler(BaseHTTPRequestHandler):
                     p: {"sha": s, "mode": m, "b64": base64.b64encode(repo.blobs[s]).decode()}
                     for p, (m, s) in repo.trees.get(tree_sha, {}).items()
                 }
-            self._send(200, {"branch": branch, "commit": commit_sha, "files": files})
+            self._send(200, {
+                "branch": branch,
+                "commit": commit_sha,
+                "parents": commit.get("parents", []),
+                "files": files,
+            })
             return
 
         backend.sleep(backend.latency)
@@ -647,12 +690,21 @@ def main():
     parser.add_argument("--latency", type=float, default=0.12, help="simulated GET latency (s)")
     parser.add_argument("--write-latency", type=float, default=0.25, help="simulated write latency (s)")
     parser.add_argument("--points-per-min", type=int, default=900, help="0 disables rate limiting")
+    parser.add_argument("--upload-bytes-per-sec", type=float, default=0,
+                        help="simulated request upload bandwidth; 0 disables")
+    parser.add_argument("--graphql-per-byte", type=float, default=1 / (20 * 1024 * 1024),
+                        help="GraphQL server processing seconds per decoded byte")
+    parser.add_argument("--tree-per-byte", type=float, default=0,
+                        help="tree server processing seconds per inline byte")
     args = parser.parse_args()
 
     backend = MockGitHub(
         latency=args.latency,
         write_latency=args.write_latency,
         points_per_min=args.points_per_min,
+        upload_bytes_per_sec=args.upload_bytes_per_sec,
+        graphql_per_byte=args.graphql_per_byte,
+        tree_per_byte=args.tree_per_byte,
     )
     httpd, url = serve(backend, args.host, args.port)
     print(f"Mock GitHub API listening on {url}")

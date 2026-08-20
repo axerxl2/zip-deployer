@@ -20,10 +20,10 @@ This implementation instead:
   2. Computes each file's git blob SHA-1 locally and diffs it against the
      branch's existing tree, so unchanged files cost zero requests.
   3. Packs binary / oversized files into createCommitOnBranch GraphQL
-     mutations on a disposable branch (up to 100 files per request), then
-     folds that tree into the one real target commit.
-  4. Keeps a pooled per-blob fallback for small sends and servers where the
-     GraphQL mutation or temporary refs are unavailable.
+     mutations across six disposable branches (up to 100 files per request).
+     The resulting blobs are referenced by SHA from one real target commit.
+  4. Runs a pooled REST blob lane concurrently and uses it for small sends or
+     GraphQL chunks that still fail after adaptive split-and-retry.
   5. Paces itself against the documented point budget, retries with backoff,
      and verifies the final tree before the commit is created.
 
@@ -78,6 +78,12 @@ BLOB_HARD_LIMIT = 100 * 1024 * 1024  # GitHub rejects blobs above ~100 MB
 MAX_BULK_ENTRIES = 100
 MAX_BULK_BYTES = 3 * 1024 * 1024
 MIN_BULK_FILES = 8
+# Independent expected-head chains remove the serial bottleneck. Six stays
+# comfortably below GitHub's concurrency ceiling and turns ~38 serial batches
+# into seven concurrent waves.
+BULK_STAGING_LANES = 6
+BULK_TRANSIENT_RETRIES = 1       # two wire attempts, then split the payload
+BULK_REST_FALLBACK_SIZE = 4      # stubborn small mutations use REST blobs
 
 GRAPHQL_COMMIT_MUTATION = """
 mutation ZipToGitStage($input: CreateCommitOnBranchInput!) {
@@ -603,13 +609,14 @@ class GitHubClient:
         url = f"{self.api_base}/repos/{self.owner}/{self.repo}{path}"
         return self._request_url(method, url, data, allow_404=allow_404, label=path)
 
-    def graphql(self, query: str, variables: dict):
-        """Run a GraphQL operation and turn GraphQL-level errors into GitHubError."""
+    def graphql(self, query: str, variables: dict, max_retries: int | None = None):
+        """Run GraphQL, optionally using a shorter operation-specific retry policy."""
         payload = self._request_url(
             "POST",
             self.graphql_base,
             {"query": query, "variables": variables},
             label="/graphql",
+            max_retries=max_retries,
         )
         errors = (payload or {}).get("errors") or []
         if errors:
@@ -624,6 +631,7 @@ class GitHubClient:
         data=None,
         allow_404: bool = False,
         label: str = "",
+        max_retries: int | None = None,
     ):
         # ensure_ascii=False keeps non-ASCII as compact UTF-8 instead of
         # expanding every character to a 6-byte \\uXXXX escape, which on a
@@ -632,7 +640,8 @@ class GitHubClient:
         points = POINTS_READ if method in ("GET", "HEAD", "OPTIONS") else POINTS_WRITE
 
         last_error = None
-        for attempt in range(self.max_retries + 1):
+        retry_limit = self.max_retries if max_retries is None else max(0, max_retries)
+        for attempt in range(retry_limit + 1):
             self.budget.spend(points)
             headers = self._headers()
             if body is not None:
@@ -642,7 +651,7 @@ class GitHubClient:
                 resp = self.transport.request(method, url, headers, body, self.timeout)
             except Exception as exc:  # network hiccup: retry
                 last_error = exc
-                if attempt == self.max_retries:
+                if attempt == retry_limit:
                     raise GitHubError(0, f"network error: {exc}", label) from exc
                 time.sleep(self._backoff(attempt))
                 continue
@@ -668,7 +677,7 @@ class GitHubClient:
             retryable = resp.status in RETRY_STATUSES or (
                 resp.status == 403 and _SECONDARY_RE.search(message or "")
             )
-            if not retryable or attempt == self.max_retries:
+            if not retryable or attempt == retry_limit:
                 raise GitHubError(resp.status, message, label)
 
             delay = self._retry_delay(resp, attempt)
@@ -993,8 +1002,14 @@ class Deployer:
         branch: str,
         expected_head: str,
         batch_number: int,
-    ) -> tuple[str, int]:
-        """Apply one GraphQL batch, splitting a rejected oversized payload."""
+    ) -> tuple[str, int, list[dict]]:
+        """Stage a batch, adaptively splitting transient/oversized failures.
+
+        GraphQL gets only two wire attempts here. Keeping the normal six-attempt
+        exponential retry on a staging chain made one bad 3 MB request stall an
+        entire lane for minutes. A stubborn small leaf is returned to the REST
+        lane; blobs are repository-wide objects, so that is equivalent.
+        """
         variables = {
             "input": {
                 "branch": {
@@ -1007,103 +1022,188 @@ class Deployer:
             }
         }
         try:
-            data = self.gh.graphql(GRAPHQL_COMMIT_MUTATION, variables)
-            return data["createCommitOnBranch"]["commit"]["oid"], 1
+            data = self.gh.graphql(
+                GRAPHQL_COMMIT_MUTATION, variables, max_retries=BULK_TRANSIENT_RETRIES
+            )
+            return data["createCommitOnBranch"]["commit"]["oid"], 1, []
         except GitHubError as exc:
-            # Mutations are retried after transport failures. If the first
-            # request actually landed, its random branch can only have moved
-            # by this operation, so accepting its child commit is idempotent.
             recovered = self._recover_staged_commit(branch, expected_head)
             if recovered:
                 log("Recovered a completed bulk batch after a lost response.", "warn")
-                return recovered, 1
-            if len(additions) > 1 and is_payload_too_large(exc):
+                return recovered, 1, []
+
+            transient = exc.status in (0, 500, 502, 503, 504)
+            splittable = is_payload_too_large(exc) or transient
+            if len(additions) > BULK_REST_FALLBACK_SIZE and splittable:
                 mid = len(additions) // 2
+                reason = "failed repeatedly" if transient else "was too large"
                 log(
-                    f"Bulk batch of {len(additions)} files was too large — "
-                    f"splitting into {mid} + {len(additions) - mid}.",
-                    "warn",
+                    f"Bulk batch of {len(additions)} files {reason} — "
+                    f"splitting into {mid} + {len(additions) - mid}.", "warn"
                 )
-                first, calls1 = self._stage_bulk_chunk(
+                first, calls1, failed1 = self._stage_bulk_chunk(
                     additions[:mid], branch, expected_head, batch_number
                 )
-                second, calls2 = self._stage_bulk_chunk(
+                second, calls2, failed2 = self._stage_bulk_chunk(
                     additions[mid:], branch, first, batch_number
                 )
-                return second, calls1 + calls2
-            raise
+                return second, calls1 + calls2, failed1 + failed2
+
+            log(
+                f"GraphQL staging failed for {len(additions)} file(s); "
+                "sending only that chunk through REST.", "warn"
+            )
+            return expected_head, 1, additions
 
     def stage_blobs_bulk(
         self,
         entries: list[FileEntry],
         parent_commit: str,
         result: DeployResult,
-    ) -> tuple[str | None, set[str]]:
-        """Write many binary blobs through batched GraphQL mutations.
+    ) -> set[str]:
+        """Upload binary blobs with six GraphQL chains plus a pooled REST lane.
 
-        createCommitOnBranch accepts RFC-4648 base64 (including arbitrary
-        binary data), unlike REST tree `content`. Batches are committed to a
-        random disposable branch. Its final tree is then used to build the
-        single real deploy commit, so the target branch still gains exactly
-        one commit and executable modes can still be corrected by the tree API.
+        All lanes steal chunks from one deque. Each staging branch has its own
+        sequential expected-head chain, while the six branches and the REST
+        pool run concurrently. The branches only manufacture git objects: the
+        final tree is deliberately built on the original target tree.
         """
         if not self.bulk:
-            return None, set()
+            return set()
 
         unique: dict[str, FileEntry] = {}
         for entry in entries:
             unique.setdefault(entry.sha, entry)
         todo = list(unique.values())
         if len(todo) < MIN_BULK_FILES:
-            return None, set()
+            return set()
 
+        entry_by_path = {entry.path: entry for entry in todo}
         additions = [
             {"path": entry.path, "contents": base64.b64encode(entry.data).decode("ascii")}
             for entry in todo
         ]
-        chunks = pack_bulk_additions(additions)
-        branch = (
-            f"zip-to-git/stage-{os.getpid()}-"
-            f"{random.getrandbits(48):012x}"
-        )
+        work = deque(pack_bulk_additions(additions))
+        lane_count = min(BULK_STAGING_LANES, len(work))
+        branches = [
+            f"zip-to-git/stage-{os.getpid()}-{random.getrandbits(48):012x}"
+            for _ in range(lane_count)
+        ]
         log(
-            f"Bulk-staging {len(todo)} binary/large blob(s) in "
-            f"{len(chunks)} GraphQL request(s)..."
+            f"Bulk-staging {len(todo)} binary/large blob(s) across {lane_count} "
+            f"parallel branches plus {self.workers} REST workers ({len(work)} batches)..."
         )
+
+        queue_lock = threading.Lock()
+        progress_lock = threading.Lock()
+        completed_shas: set[str] = set()
+        completed_bytes = 0
+        calls = 0
+
+        def claim(left: bool) -> list[dict] | None:
+            with queue_lock:
+                if not work:
+                    return None
+                return work.popleft() if left else work.pop()
+
+        def completed(items: list[dict]) -> None:
+            nonlocal completed_bytes
+            with progress_lock:
+                for item in items:
+                    entry = entry_by_path[item["path"]]
+                    if entry.sha not in completed_shas:
+                        completed_shas.add(entry.sha)
+                        completed_bytes += entry.size
+                done_bytes = completed_bytes
+                done_files = len(completed_shas)
+            total_bytes = sum(e.size for e in todo)
+            self._tick(
+                done_bytes, total_bytes,
+                f"{done_bytes / (1024 * 1024):.1f}/{total_bytes / (1024 * 1024):.1f} MB · "
+                f"{done_files}/{len(todo)} files",
+            )
+
+        def rest_upload(items: list[dict]) -> None:
+            def upload(item: dict) -> None:
+                entry = entry_by_path[item["path"]]
+                blob = self.gh.request("POST", "/git/blobs", {
+                    "content": item["contents"], "encoding": "base64"
+                })
+                if blob["sha"] != entry.sha:
+                    raise GitHubError(422, f"blob SHA mismatch for {entry.path}", "/git/blobs")
+                completed([item])
+            with ThreadPoolExecutor(max_workers=self.workers) as rest_pool:
+                list(rest_pool.map(upload, items))
 
         try:
-            self.gh.request(
-                "POST", "/git/refs", {"ref": f"refs/heads/{branch}", "sha": parent_commit}
-            )
-            self._staging_branches.append(branch)
-            head = parent_commit
-            calls = 0
-            staged_files = 0
-            for index, chunk in enumerate(chunks, 1):
-                head, used = self._stage_bulk_chunk(chunk, branch, head, index)
-                calls += used
-                staged_files += len(chunk)
-                self._tick(staged_files, len(todo), f"{staged_files}/{len(todo)} binary files")
-                if len(chunks) > 1:
-                    log(f"  -> bulk batch {index}/{len(chunks)} ({len(chunk)} files)")
-            commit = self.gh.request("GET", f"/git/commits/{head}")
+            # Create all refs before starting work so GraphQL lanes get the
+            # first claims and REST genuinely steals spare work rather than
+            # draining the queue while refs are still being created.
+            for branch in branches:
+                self.gh.request("POST", "/git/refs", {
+                    "ref": f"refs/heads/{branch}", "sha": parent_commit
+                })
+                self._staging_branches.append(branch)
+
+            kickoff = threading.Event()
+
+            def graphql_lane(branch: str) -> int:
+                head = parent_commit
+                lane_calls = 0
+                batch_number = 0
+                while True:
+                    chunk = claim(True)
+                    if chunk is None:
+                        break
+                    batch_number += 1
+                    if batch_number == 1:
+                        # Let every GraphQL chain reserve a batch, then launch
+                        # it at the same time as the REST work-stealing wave.
+                        kickoff.wait()
+                    head, used, failed = self._stage_bulk_chunk(
+                        chunk, branch, head, batch_number
+                    )
+                    lane_calls += used
+                    succeeded = [item for item in chunk if item not in failed]
+                    if succeeded:
+                        completed(succeeded)
+                    if failed:
+                        rest_upload(failed)
+                return lane_calls
+
+            def rest_lane() -> None:
+                # Steal one worker-width wave from the tail. This keeps all 12
+                # REST connections busy concurrently without turning a
+                # thousands-file archive back into thousands of point-heavy
+                # POSTs; GraphQL chains consume the remainder in bulk.
+                with queue_lock:
+                    if not work:
+                        kickoff.set()
+                        return
+                    chunk = work.pop()
+                    stolen = chunk[-self.workers:]
+                    remainder = chunk[:-self.workers]
+                    if remainder:
+                        work.append(remainder)
+                kickoff.set()
+                rest_upload(stolen)
+
+            with ThreadPoolExecutor(max_workers=lane_count + 1) as lanes:
+                graph_futures = [lanes.submit(graphql_lane, b) for b in branches]
+                rest_future = lanes.submit(rest_lane)
+                calls = sum(f.result() for f in graph_futures)
+                rest_future.result()
         except GitHubError as exc:
-            log(
-                f"Bulk binary API unavailable ({exc}); falling back to pooled blob uploads.",
-                "warn",
-            )
-            if branch in self._staging_branches:
-                try:
-                    self.gh.request("DELETE", f"/git/refs/heads/{branch}")
-                except Exception:
-                    pass
-                self._staging_branches.remove(branch)
-            return None, set()
+            log(f"Hybrid bulk upload failed: {exc}", "warn")
+            raise
 
         result.bulk_batches += calls
-        result.blobs_uploaded += len(todo)
-        log(f"Bulk-staged {len(todo)} blob(s) in {calls} request(s).")
-        return commit["tree"]["sha"], set(unique)
+        result.blobs_uploaded += len(completed_shas)
+        log(
+            f"Uploaded {len(completed_shas)} blob(s), "
+            f"{completed_bytes / (1024 * 1024):.1f} MB, in {calls} GraphQL batch(es)."
+        )
+        return completed_shas
 
     # -- blob uploads ------------------------------------------------------
 
@@ -1119,12 +1219,14 @@ class Deployer:
         log(f"Uploading {total} binary/large file(s) as blobs on {self.workers} connections...")
 
         done = 0
+        done_bytes = 0
+        total_bytes = sum(e.size for e in todo)
         started = time.monotonic()
         lock = threading.Lock()
         mapping: dict[str, str] = {}
 
         def upload(entry: FileEntry):
-            nonlocal done
+            nonlocal done, done_bytes
             payload = {
                 "content": base64.b64encode(entry.data).decode("ascii"),
                 "encoding": "base64",
@@ -1136,8 +1238,14 @@ class Deployer:
             with lock:
                 mapping[entry.sha] = returned
                 done += 1
+                done_bytes += entry.size
                 current = done
-            self._tick(current, total, f"{current}/{total} blobs")
+                current_bytes = done_bytes
+            self._tick(
+                current_bytes, total_bytes,
+                f"{current_bytes / (1024 * 1024):.1f}/{total_bytes / (1024 * 1024):.1f} MB · "
+                f"{current}/{total} blobs",
+            )
             if current % 25 == 0 or current == total:
                 rate = current / max(time.monotonic() - started, 1e-6)
                 log(f"  -> {current}/{total} blobs ({rate:.1f}/s)")
@@ -1290,10 +1398,9 @@ class Deployer:
         # Binary bytes cannot be represented by REST tree `content`. For a
         # handful of them pooled blob POSTs are cheapest; for a large set the
         # GraphQL staging branch packs up to 100 binary files into each write.
-        self._phase(0.10, 0.38, "Bulk-staging binary files")
-        bulk_tree, bulk_shas = self.stage_blobs_bulk(needs_upload, parent_commit, result)
+        self._phase(0.10, 0.45, "Uploading binary files")
+        bulk_shas = self.stage_blobs_bulk(needs_upload, parent_commit, result)
         remaining_uploads = [e for e in needs_upload if e.sha not in bulk_shas]
-        self._phase(0.38, 0.45, "Uploading blobs")
         self.upload_blobs(remaining_uploads, result)
         result.inlined = len(inline_entries)
 
@@ -1313,11 +1420,11 @@ class Deployer:
             )
         tree_items.extend(deletions)
 
-        # A successful bulk stage already contains its binary additions on top
-        # of the original tree. Chaining the regular tree entries onto it folds
-        # text, reused objects, deletions, and executable modes into one tree.
+        # Staging branches only populate the repository object database. Their
+        # trees contain disjoint subsets, so the authoritative final tree must
+        # always be built on the target branch's original base tree.
         self._phase(0.50, 0.85, "Writing git tree")
-        tree_sha = self.build_tree(tree_items, bulk_tree or base_tree, result)
+        tree_sha = self.build_tree(tree_items, base_tree, result)
 
         if self.verify:
             log("Verifying tree contents against locally computed SHAs...")
