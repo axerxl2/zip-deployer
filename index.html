@@ -182,7 +182,9 @@
             maxBulkEntries: 100,               // binary files per GraphQL mutation
             maxBulkBytes: 3 * 1024 * 1024,     // bounded base64 mutation payload
             minBulkFiles: 8,                   // pooled REST is cheaper below this
-            workers: 12,                       // small blob-upload fallback
+            bulkStagingLanes: 6,               // independent expected-head chains
+            bulkFallbackSize: 4,               // stubborn leaves switch to REST
+            workers: 12,                       // concurrent REST work-stealing lane
             pointsPerMin: 900,                 // GitHub's secondary rate limit
             safety: 0.85,                      // margin for client/server clock skew
             maxRetries: 6
@@ -498,10 +500,10 @@
                 throw lastError || new Error(`Request failed: ${path}`);
             }
 
-            async graphql(query, variables) {
+            async graphql(query, variables, maxRetries = CONFIG.maxRetries) {
                 const url = 'https://api.github.com/graphql';
                 let lastError = null;
-                for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
+                for (let attempt = 0; attempt <= maxRetries; attempt++) {
                     await this.budget.spend(5);
                     let res;
                     const t0 = Date.now();
@@ -518,7 +520,7 @@
                         });
                     } catch (networkError) {
                         lastError = networkError;
-                        if (attempt === CONFIG.maxRetries) throw networkError;
+                        if (attempt === maxRetries) throw networkError;
                         await sleep(backoffMs(attempt));
                         continue;
                     }
@@ -537,7 +539,7 @@
                     try { message = (JSON.parse(text).message) || text; } catch (e) { /* keep raw */ }
                     const retryable = res.status === 429 || res.status >= 500 ||
                         (res.status === 403 && /rate limit|abuse/i.test(message));
-                    if (!retryable || attempt === CONFIG.maxRetries) {
+                    if (!retryable || attempt === maxRetries) {
                         throw new Error(`GitHub GraphQL ${res.status} on /graphql: ${message}`);
                     }
                     const retryAfter = parseFloat(res.headers.get('retry-after'));
@@ -663,6 +665,8 @@
             for (const file of files) if (!unique.has(file.sha)) unique.set(file.sha, file);
             const todo = [...unique.values()];
             let done = 0;
+            let doneBytes = 0;
+            const totalBytes = todo.reduce((sum, file) => sum + file.size, 0);
             await runPool(todo, CONFIG.workers, async (file) => {
                 const blob = await gh.call('/git/blobs', 'POST', {
                     content: toBase64(file.data),
@@ -672,7 +676,8 @@
                     log(`Blob SHA mismatch for ${file.path}`, 'warn');
                 }
                 done++;
-                onProgress(done, todo.length);
+                doneBytes += file.size;
+                onProgress(done, todo.length, doneBytes, totalBytes);
             });
             return todo.length;
         }
@@ -716,6 +721,11 @@
             }
         }
 
+        function isTransientBulkError(error) {
+            return /graphql (?:0|500|502|503|504)|network|timeout|timed out|fetch failed/i
+                .test(String(error && error.message || error));
+        }
+
         async function stageBulkChunk(gh, additions, branch, expectedHead, batchNumber) {
             const variables = {
                 input: {
@@ -729,69 +739,125 @@
                 }
             };
             try {
-                const data = await gh.graphql(GRAPHQL_COMMIT_MUTATION, variables);
-                return { head: data.createCommitOnBranch.commit.oid, calls: 1 };
+                // Two attempts only: then split instead of blocking this chain
+                // behind the normal long exponential retry policy.
+                const data = await gh.graphql(GRAPHQL_COMMIT_MUTATION, variables, 1);
+                return { head: data.createCommitOnBranch.commit.oid, calls: 1, failed: [] };
             } catch (error) {
                 const recovered = await recoverStagedCommit(gh, branch, expectedHead);
                 if (recovered) {
                     log('Recovered a completed bulk batch after a lost response.', 'warn');
-                    return { head: recovered, calls: 1 };
+                    return { head: recovered, calls: 1, failed: [] };
                 }
-                if (additions.length > 1 && isPayloadTooLarge(error)) {
+                const transient = isTransientBulkError(error);
+                if (additions.length > CONFIG.bulkFallbackSize &&
+                    (isPayloadTooLarge(error) || transient)) {
                     const mid = additions.length >> 1;
-                    log(`Bulk batch of ${additions.length} files was too large — splitting into ${mid} + ${additions.length - mid}.`, 'warn');
+                    log(`Bulk batch of ${additions.length} files ${transient ? 'failed repeatedly' : 'was too large'} — splitting into ${mid} + ${additions.length - mid}.`, 'warn');
                     const first = await stageBulkChunk(gh, additions.slice(0, mid), branch, expectedHead, batchNumber);
                     const second = await stageBulkChunk(gh, additions.slice(mid), branch, first.head, batchNumber);
-                    return { head: second.head, calls: first.calls + second.calls };
+                    return {
+                        head: second.head,
+                        calls: first.calls + second.calls,
+                        failed: first.failed.concat(second.failed)
+                    };
                 }
-                throw error;
+                log(`GraphQL staging failed for ${additions.length} file(s); sending only that chunk through REST.`, 'warn');
+                return { head: expectedHead, calls: 1, failed: additions };
             }
         }
 
-        async function stageBlobsBulk(gh, files, parentCommit, onProgress) {
+        async function stageBlobsBulk(gh, files, parentCommit, onProgress, staging) {
             const unique = new Map();
             for (const file of files) if (!unique.has(file.sha)) unique.set(file.sha, file);
             const todo = [...unique.values()];
             if (todo.length < CONFIG.minBulkFiles) return null;
 
+            const byPath = new Map(todo.map((file) => [file.path, file]));
             const additions = todo.map((file) => ({ path: file.path, contents: toBase64(file.data) }));
-            const chunks = packBulkAdditions(additions);
-            const branch = randomStageBranch();
-            log(`Bulk-staging ${todo.length} binary/large blob(s) in ${chunks.length} GraphQL request(s)...`);
-            try {
-                await gh.call('/git/refs', 'POST', {
-                    ref: `refs/heads/${branch}`,
-                    sha: parentCommit
+            const queue = packBulkAdditions(additions);
+            const laneCount = Math.min(CONFIG.bulkStagingLanes, queue.length);
+            const branches = Array.from({ length: laneCount }, randomStageBranch);
+            // Register immediately so finally-cleanup also covers partial ref
+            // creation or a lane throwing before this function returns.
+            staging.current = { branches };
+            const totalBytes = todo.reduce((sum, file) => sum + file.size, 0);
+            const completedShas = new Set();
+            let completedBytes = 0;
+            let calls = 0;
+
+            log(`Bulk-staging ${todo.length} binary/large blob(s) across ${laneCount} parallel branches plus ${CONFIG.workers} REST workers (${queue.length} batches)...`);
+            for (const branch of branches) {
+                await gh.call('/git/refs', 'POST', { ref: `refs/heads/${branch}`, sha: parentCommit });
+            }
+
+            function markCompleted(items) {
+                for (const item of items) {
+                    const file = byPath.get(item.path);
+                    if (!completedShas.has(file.sha)) {
+                        completedShas.add(file.sha);
+                        completedBytes += file.size;
+                    }
+                }
+                onProgress(completedBytes, totalBytes, completedShas.size, todo.length);
+            }
+
+            async function restUpload(items) {
+                await runPool(items, CONFIG.workers, async (item) => {
+                    const file = byPath.get(item.path);
+                    const blob = await gh.call('/git/blobs', 'POST', {
+                        content: item.contents, encoding: 'base64'
+                    });
+                    if (blob.sha !== file.sha) throw new Error(`Blob SHA mismatch for ${file.path}`);
+                    markCompleted([item]);
                 });
+            }
+
+            async function graphqlLane(branch) {
                 let head = parentCommit;
-                let calls = 0;
-                let completed = 0;
-                for (let i = 0; i < chunks.length; i++) {
-                    const staged = await stageBulkChunk(gh, chunks[i], branch, head, i + 1);
+                let laneCalls = 0;
+                let batch = 0;
+                for (;;) {
+                    const chunk = queue.shift();
+                    if (!chunk) break;
+                    const staged = await stageBulkChunk(gh, chunk, branch, head, ++batch);
                     head = staged.head;
-                    calls += staged.calls;
-                    completed += chunks[i].length;
-                    onProgress(completed, todo.length);
-                    if (chunks.length > 1) log(`  -> bulk batch ${i + 1}/${chunks.length} (${chunks[i].length} files)`);
+                    laneCalls += staged.calls;
+                    const failed = new Set(staged.failed);
+                    markCompleted(chunk.filter((item) => !failed.has(item)));
+                    if (staged.failed.length) await restUpload(staged.failed);
                     await yieldToUi();
                 }
-                const commit = await gh.call(`/git/commits/${head}`);
-                log(`Bulk-staged ${todo.length} blob(s) in ${calls} request(s).`);
-                return { treeSha: commit.tree.sha, shas: new Set(unique.keys()), branch, calls, count: todo.length };
-            } catch (error) {
-                log(`Bulk binary API unavailable (${error.message}); falling back to pooled blob uploads.`, 'warn');
-                try { await gh.call(`/git/refs/heads/${branch}`, 'DELETE'); } catch (e) { /* best effort */ }
-                return null;
+                return laneCalls;
             }
+
+            // Start GraphQL chains first; each synchronously claims its first
+            // batch before the REST coordinator steals one worker-width wave.
+            const graphPromises = branches.map(graphqlLane);
+            const restPromise = (async () => {
+                const chunk = queue.pop();
+                if (!chunk) return;
+                const stolen = chunk.splice(Math.max(0, chunk.length - CONFIG.workers));
+                if (chunk.length) queue.push(chunk);
+                await restUpload(stolen);
+            })();
+            calls = (await Promise.all(graphPromises)).reduce((sum, n) => sum + n, 0);
+            await restPromise;
+
+            log(`Uploaded ${completedShas.size} blob(s), ${humanBytes(completedBytes)}, in ${calls} GraphQL batch(es).`);
+            return { shas: completedShas, branches, calls, count: completedShas.size };
         }
 
         async function cleanupStage(gh, stage) {
             if (!stage) return;
-            try {
-                await gh.call(`/git/refs/heads/${stage.branch}`, 'DELETE');
-            } catch (error) {
-                log(`Could not remove temporary branch '${stage.branch}': ${error.message}`, 'warn');
-            }
+            const branches = stage.branches || (stage.branch ? [stage.branch] : []);
+            await Promise.all(branches.map(async (branch) => {
+                try {
+                    await gh.call(`/git/refs/heads/${branch}`, 'DELETE');
+                } catch (error) {
+                    log(`Could not remove temporary branch '${branch}': ${error.message}`, 'warn');
+                }
+            }));
         }
 
         function packTreeItems(items) {
@@ -939,23 +1005,26 @@
 
             let uploadedCount = 0;
             let bulkShas = new Set();
-            let treeBase = treeSha;
             if (needsUpload.length) {
-                setProgress(0.15, 'Bulk-staging binary files...', `0 / ${needsUpload.length}`);
-                const bulkStage = bulk ? await stageBlobsBulk(gh, needsUpload, commitSha, (done, total) => {
-                    setProgress(0.15 + 0.30 * (done / total), 'Bulk-staging binary files...', `${done} / ${total}`);
-                }) : null;
+                const uploadBytes = needsUpload.reduce((sum, file) => sum + file.size, 0);
+                setProgress(0.15, 'Uploading binary files...', `0 / ${humanBytes(uploadBytes)}`);
+                const bulkStage = bulk ? await stageBlobsBulk(gh, needsUpload, commitSha,
+                    (doneBytes, totalBytes, doneFiles, totalFiles) => {
+                        setProgress(0.15 + 0.30 * (doneBytes / Math.max(totalBytes, 1)),
+                            'Uploading binary files...',
+                            `${humanBytes(doneBytes)} / ${humanBytes(totalBytes)} · ${doneFiles} / ${totalFiles} files`);
+                    }, staging) : null;
                 staging.current = bulkStage;
                 if (bulkStage) {
-                    treeBase = bulkStage.treeSha;
                     bulkShas = bulkStage.shas;
                     uploadedCount += bulkStage.count;
                 }
                 const remaining = needsUpload.filter((f) => !bulkShas.has(f.sha));
                 if (remaining.length) {
-                    setProgress(0.15, 'Uploading remaining binary files...', `0 / ${remaining.length}`);
-                    uploadedCount += await uploadBlobs(gh, remaining, (done, total) => {
-                        setProgress(0.15 + 0.30 * (done / total), 'Uploading remaining binary files...', `${done} / ${total}`);
+                    uploadedCount += await uploadBlobs(gh, remaining, (done, total, doneBytes, totalBytes) => {
+                        setProgress(0.15 + 0.30 * (doneBytes / Math.max(totalBytes, 1)),
+                            'Uploading binary files...',
+                            `${humanBytes(doneBytes)} / ${humanBytes(totalBytes)} · ${done} / ${total} files`);
                     });
                 }
                 log(`Uploaded ${uploadedCount} unique blob(s).`);
@@ -966,7 +1035,9 @@
                 .concat(deletions);
 
             setProgress(0.5, 'Writing the git tree...', '');
-            const { treeSha: newTree, calls } = await buildTree(gh, treeItems, treeBase, (done, total) => {
+            // Staging trees are disjoint object factories; compose every path
+            // authoritatively on the original target tree.
+            const { treeSha: newTree, calls } = await buildTree(gh, treeItems, treeSha, (done, total) => {
                 setProgress(0.5 + 0.35 * (done / total), 'Writing the git tree...', `${done} / ${total} requests`);
             });
             log(`Tree written in ${calls} request(s).`);

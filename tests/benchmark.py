@@ -11,6 +11,7 @@ rewritten to point at the mock.
     python tests/benchmark.py                 # full run, 3000 files
     python tests/benchmark.py --files 500     # quicker
     python tests/benchmark.py --profile binary --skip-legacy
+    python tests/benchmark.py --profile music --files 400 --skip-legacy
     python tests/benchmark.py --skip-legacy   # only measure the new engine
 
 Numbers are latency-simulated, not measurements against github.com; the point
@@ -49,6 +50,9 @@ BASE_COMMIT = "a3f5bfca797f7e6def01e79d3b5f110346d1acac"  # pre-optimisation app
 GET_LATENCY = 0.12
 WRITE_LATENCY = 0.25
 PER_ENTRY_LATENCY = 0.002
+UPLOAD_BYTES_PER_SEC = 20 * 1024 * 1024
+GRAPHQL_PER_BYTE = 1 / (20 * 1024 * 1024)
+TREE_PER_BYTE = 1 / (80 * 1024 * 1024)
 POINTS_PER_MIN = 900
 
 
@@ -313,6 +317,29 @@ def make_binary_zip(n_files: int, seed: int = 7331) -> tuple[bytes, dict[str, by
     return buffer.getvalue(), files
 
 
+def make_music_zip(n_files: int, seed: int = 8675309) -> tuple[bytes, dict[str, bytes]]:
+    """Music-library shape: thousands of images plus genuinely multi-MB tracks."""
+    rng = random.Random(seed)
+    files: dict[str, bytes] = {}
+    track_count = max(4, n_files // 100)
+    for i in range(n_files):
+        if i < track_count:
+            size = 2 * 1024 * 1024 + rng.randint(0, 256 * 1024)
+            path = f"music/audio/track{i:04d}.mp3"
+            header = b"ID3\x04\x00\x00" + i.to_bytes(4, "big")
+        else:
+            size = rng.randint(4 * 1024, 24 * 1024)
+            path = f"music/art/cover{i:05d}.png"
+            header = b"\x89PNG\r\n\x1a\n" + i.to_bytes(4, "big")
+        files[path] = header + rng.randbytes(size - len(header))
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        for path, data in files.items():
+            zf.writestr(path, data)
+    return buffer.getvalue(), files
+
+
 def make_project_zip(n_files: int, seed: int = 1337) -> tuple[bytes, dict[str, bytes]]:
     """A realistic front-end-ish project: mostly small text, some binaries."""
     rng = random.Random(seed)
@@ -388,6 +415,9 @@ class Bench:
             per_entry_latency=PER_ENTRY_LATENCY,
             jitter=0.3,
             points_per_min=POINTS_PER_MIN if rate_limit else 0,
+            upload_bytes_per_sec=UPLOAD_BYTES_PER_SEC,
+            graphql_per_byte=GRAPHQL_PER_BYTE,
+            tree_per_byte=TREE_PER_BYTE,
         )
         self.httpd, self.url = serve(self.backend)
 
@@ -468,6 +498,16 @@ def _module_available(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
+def _legacy_source_available() -> bool:
+    """Shallow CI/Arena checkouts may not contain the historical baseline."""
+    check = subprocess.run(
+        ["git", "cat-file", "-e", f"{BASE_COMMIT}:app.py"],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+    )
+    return check.returncode == 0
+
+
 def fmt_duration(seconds: float) -> str:
     if seconds < 90:
         return f"{seconds:.1f}s"
@@ -480,8 +520,8 @@ def fmt_duration(seconds: float) -> str:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--files", type=int, default=3000, help="files in the benchmark ZIP")
-    parser.add_argument("--profile", choices=("generic", "astro", "binary"), default="generic",
-                        help="corpus shape: generic web, Astro/TypeScript, or all-binary assets")
+    parser.add_argument("--profile", choices=("generic", "astro", "binary", "music"), default="generic",
+                        help="corpus shape: generic web, Astro/TS, small binary, or multi-MB music")
     parser.add_argument("--legacy-files", type=int, default=200,
                         help="subset size for the legacy run (it is too slow to run in full)")
     parser.add_argument("--skip-legacy", action="store_true")
@@ -496,6 +536,7 @@ def main():
             "generic": make_project_zip,
             "astro": make_astro_zip,
             "binary": make_binary_zip,
+            "music": make_music_zip,
         }
         builder = builders[args.profile]
         print(f"Building a {args.files}-file {args.profile} project ZIP...")
@@ -514,6 +555,8 @@ def main():
 
         print("Simulated GitHub API:")
         print(f"  GET latency ~{GET_LATENCY * 1000:.0f} ms, write latency ~{WRITE_LATENCY * 1000:.0f} ms")
+        print(f"  upload bandwidth per connection: {UPLOAD_BYTES_PER_SEC / 1024 / 1024:.0f} MB/s")
+        print("  GraphQL/tree processing includes per-byte cost")
         print(f"  secondary rate limit: {POINTS_PER_MIN} points/min (GET=1, POST=5)\n")
 
         # ---- 1. New engine, full corpus, rate limit enforced --------------
@@ -573,6 +616,10 @@ def main():
         if missing and not args.skip_legacy:
             print(f"\n[4-5/5] Skipping the original-engine comparison: it needs "
                   f"{', '.join(missing)} (pip install {' '.join(missing)}).")
+            args.skip_legacy = True
+        if not args.skip_legacy and not _legacy_source_available():
+            print("\n[4-5/5] Skipping the original-engine comparison: this shallow "
+                  f"checkout does not contain {BASE_COMMIT[:10]}.")
             args.skip_legacy = True
 
         if not args.skip_legacy:
