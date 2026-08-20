@@ -164,9 +164,9 @@ func (g *GitHubAPI) updateRef(branch, commitSHA string) error {
 }
 
 func (g *GitHubAPI) initRepo(branch string) error {
-	readmeContent := base64.StdEncoding.EncodeToString([]byte("# Project Repository\nInitialized automatically by GitHub ZIP Deployer."))
+	readmeContent := base64.StdEncoding.EncodeToString([]byte("# Project Repository\nInitialized automatically by Zip to git."))
 	body := ContentPut{
-		Message: "Initial commit by GitHub ZIP Deployer",
+		Message: "Initial commit by Zip to git",
 		Content: readmeContent,
 		Branch:  branch,
 	}
@@ -209,7 +209,7 @@ func terminalReadPassword() ([]byte, error) {
 }
 
 func main() {
-	fmt.Printf("\n\033[36m\033[1m🚀 GitHub ZIP Deployer — Tool by Icii White\033[0m\n\n")
+	fmt.Printf("\n\033[36m\033[1m🚀 Zip to git — Tool by Icii White\033[0m\n\n")
 	token := readInput("\033[33m🔑 Personal Access Token (repo scope): \033[0m", true)
 	for token == "" {
 		token = readInput("\033[31mToken is required: \033[0m", true)

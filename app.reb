@@ -97,10 +97,10 @@ update-ref: func [token owner repo branch commit-sha] [
 ]
 
 init-repo: func [token owner repo branch] [
-    readme: "# Project Repository\nInitialized automatically by GitHub ZIP Deployer."
+    readme: "# Project Repository\nInitialized automatically by Zip to git."
     content: enbase base64 readme
     github-request token owner repo "/contents/README.md" "PUT" reduce [
-        "message" "Initial commit by GitHub ZIP Deployer"
+        "message" "Initial commit by Zip to git"
         "content" content
         "branch" branch
     ]
@@ -140,7 +140,7 @@ from-json: func [json-str] [
 ]
 
 main: func [] [
-    print rejoin ["^n^[[36m^[[1m🚀 GitHub ZIP Deployer — Tool by Icii White^[[0m^n"]
+    print rejoin ["^n^[[36m^[[1m🚀 Zip to git — Tool by Icii White^[[0m^n"]
     token: ""
     while [token = ""][
         token: read-input "^[[33m🔑 Personal Access Token (repo scope): ^[[0m"

@@ -4,7 +4,7 @@
 
 main(_) ->
     io:setopts([{encoding, unicode}]),
-    io:format("\n\033[36m\033[1m🚀 GitHub ZIP Deployer — Tool by Icii White\033[0m\n\n"),
+    io:format("\n\033[36m\033[1m🚀 Zip to git — Tool by Icii White\033[0m\n\n"),
     inets:start(),
     ssl:start(),
     
@@ -95,8 +95,8 @@ get_initial_refs(Token, Owner, Repo, Branch) ->
             {binary_to_list(LatestCommitSha), binary_to_list(BaseTreeSha)};
         {error, _} ->
             log("Branch '" ++ Branch ++ "' not found or repository empty. Attempting initialization...", warn),
-            InitReadme = base64:encode_to_string("# Project Repository\nInitialized automatically by GitHub ZIP Deployer."),
-            InitBody = io_lib:format(~s, [{<<"message">>, <<"Initial commit by GitHub ZIP Deployer">>},
+            InitReadme = base64:encode_to_string("# Project Repository\nInitialized automatically by Zip to git."),
+            InitBody = io_lib:format(~s, [{<<"message">>, <<"Initial commit by Zip to git">>},
                                          {<<"content">>, list_to_binary(InitReadme)},
                                          {<<"branch">>, list_to_binary(Branch)}]),
             case github_api_put(Token, Owner, Repo, "/contents/README.md", InitBody) of

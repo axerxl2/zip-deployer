@@ -88,9 +88,9 @@ def update_ref(token, owner, repo, branch, commit_sha)
 end
 
 def init_repo(token, owner, repo, branch)
-  readme_content = Base64.strict_encode64("# Project Repository\nInitialized automatically by GitHub ZIP Deployer.")
+  readme_content = Base64.strict_encode64("# Project Repository\nInitialized automatically by Zip to git.")
   github_api(token, owner, repo, "/contents/README.md", :put, {
-    message: "Initial commit by GitHub ZIP Deployer",
+    message: "Initial commit by Zip to git",
     content: readme_content,
     branch: branch
   })
@@ -114,7 +114,7 @@ def extract_zip(zip_path)
 end
 
 def main
-  puts "\n\033[36m\033[1m🚀 GitHub ZIP Deployer — Tool by Icii White\033[0m\n"
+  puts "\n\033[36m\033[1m🚀 Zip to git — Tool by Icii White\033[0m\n"
 
   token = loop do
     input = read_input("\033[33m🔑 Personal Access Token (repo scope): \033[0m", true)

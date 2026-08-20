@@ -523,7 +523,7 @@ def main():
         deployed = bench.remote_files(repo="bench")
         # Drop the auto-generated bootstrap README, but only if the fixture did
         # not ship one of its own.
-        bootstrap = b"# Project Repository\n\nInitialized automatically by GitHub ZIP Deployer.\n"
+        bootstrap = b"# Project Repository\n\nInitialized automatically by Zip to git.\n"
         if deployed.get("README.md") == bootstrap and "README.md" not in expected:
             del deployed["README.md"]
         matched = sum(1 for p, d in expected.items() if deployed.get(p) == d)

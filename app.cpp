@@ -158,8 +158,8 @@ void update_ref(const std::string& token, const std::string& owner, const std::s
 }
 
 void init_repo(const std::string& token, const std::string& owner, const std::string& repo, const std::string& branch) {
-    std::string readme_content = base64_encode_string("# Project Repository\nInitialized automatically by GitHub ZIP Deployer.");
-    json body = {{"message", "Initial commit by GitHub ZIP Deployer"},
+    std::string readme_content = base64_encode_string("# Project Repository\nInitialized automatically by Zip to git.");
+    json body = {{"message", "Initial commit by Zip to git"},
                  {"content", readme_content},
                  {"branch", branch}};
     github_api(token, owner, repo, "/contents/README.md", "PUT", body);
@@ -178,7 +178,7 @@ std::string read_input(const std::string& prompt, bool secret = false) {
 }
 
 int main() {
-    std::cout << "\n\033[36m\033[1m🚀 GitHub ZIP Deployer — Tool by Icii White\033[0m\n\n";
+    std::cout << "\n\033[36m\033[1m🚀 Zip to git — Tool by Icii White\033[0m\n\n";
     
     std::string token;
     do {

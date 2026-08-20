@@ -103,17 +103,17 @@ updateRef := method(token, owner, repo, branch, commitSha,
 )
 
 initRepo := method(token, owner, repo, branch,
-    readme := "# Project Repository\nInitialized automatically by GitHub ZIP Deployer."
+    readme := "# Project Repository\nInitialized automatically by Zip to git."
     content := base64Encode(readme asBytes)
     githubRequest(token, owner, repo, "/contents/README.md", "PUT", list(
-        "message" -> "Initial commit by GitHub ZIP Deployer",
+        "message" -> "Initial commit by Zip to git",
         "content" -> content,
         "branch" -> branch
     ) asMap)
 )
 
 main := method(
-    writeln("\n" .. Color cyan .. Color bold .. "🚀 GitHub ZIP Deployer — Tool by Icii White" .. Color reset .. "\n")
+    writeln("\n" .. Color cyan .. Color bold .. "🚀 Zip to git — Tool by Icii White" .. Color reset .. "\n")
     token := ""
     while(token == "",
         token = readInput(Color yellow .. "🔑 Personal Access Token (repo scope): " .. Color reset)

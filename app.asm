@@ -1,4 +1,4 @@
-; app.asm - GitHub ZIP Deployer for x86-64 Linux
+; app.asm - Zip to git for x86-64 Linux
 ; NASM syntax, links with libc, libcurl, libzip, libjansson
 ; Build: nasm -f elf64 app.asm && gcc -no-pie -o app app.o -lcurl -lzip -ljansson
 
@@ -27,7 +27,7 @@ section .rodata
     log_error db 0x1b, "[31m✖ ", 0
     log_reset db 0x1b, "[0m", 0
     time_fmt db "%H:%M:%S", 0
-    header_line db 0x0a, 0x1b, "[36m", 0x1b, "[1m🚀 GitHub ZIP Deployer — Tool by Icii White", 0x1b, "[0m", 0x0a, 0
+    header_line db 0x0a, 0x1b, "[36m", 0x1b, "[1m🚀 Zip to git — Tool by Icii White", 0x1b, "[0m", 0x0a, 0
     api_base db "https://api.github.com/repos/", 0
     git_ref_heads db "/git/ref/heads/", 0
     git_commits db "/git/commits/", 0
@@ -36,7 +36,7 @@ section .rodata
     git_commits_post db "/git/commits", 0
     git_refs_patch db "/git/refs/heads/", 0
     contents_readme db "/contents/README.md", 0
-    user_agent db "GitHub-ZIP-Deployer", 0
+    user_agent db "Zip-to-git", 0
     auth_header db "Authorization: Bearer ", 0
     accept_header db "Accept: application/vnd.github.v3+json", 0
     content_type db "Content-Type: application/json", 0
@@ -58,8 +58,8 @@ section .rodata
     json_type db "type", 0
     json_blob db "blob", 0
     mode_644 db "100644", 0
-    init_readme db "# Project Repository", 0x0a, "Initialized automatically by GitHub ZIP Deployer.", 0
-    init_commit_msg db "Initial commit by GitHub ZIP Deployer", 0
+    init_readme db "# Project Repository", 0x0a, "Initialized automatically by Zip to git.", 0
+    init_commit_msg db "Initial commit by Zip to git", 0
     commit_msg_prefix db "Upload ZIP deployment via Web Client", 0x0a, 0x0a, "Uploaded ", 0
     commit_msg_suffix db " files.", 0
     deploy_success_msg db "Successfully deployed ", 0
