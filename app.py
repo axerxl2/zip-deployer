@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GitHub ZIP Deployer — fast edition.
+Zip to git — fast edition.
 
 Extracts a ZIP archive and pushes its contents to a GitHub repository through
 the Git Data API, in a single commit.
@@ -80,7 +80,7 @@ MAX_BULK_BYTES = 3 * 1024 * 1024
 MIN_BULK_FILES = 8
 
 GRAPHQL_COMMIT_MUTATION = """
-mutation ZipDeployerStage($input: CreateCommitOnBranchInput!) {
+mutation ZipToGitStage($input: CreateCommitOnBranchInput!) {
   createCommitOnBranch(input: $input) {
     commit { oid }
   }
@@ -482,10 +482,10 @@ class _StdlibTransport:
 def make_transport(workers: int):
     """Prefer `requests` for its connection pooling, fall back to the stdlib.
 
-    Set ZIP_DEPLOYER_TRANSPORT=stdlib|requests to force one (used by the tests
+    Set ZIP_TO_GIT_TRANSPORT=stdlib|requests to force one (used by the tests
     so both code paths stay covered).
     """
-    preference = os.environ.get("ZIP_DEPLOYER_TRANSPORT", "").lower()
+    preference = os.environ.get("ZIP_TO_GIT_TRANSPORT", "").lower()
     if preference == "stdlib":
         return _StdlibTransport(workers)
     try:
@@ -595,7 +595,7 @@ class GitHubClient:
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "Content-Type": "application/json",
-            "User-Agent": "github-zip-deployer/3.0",
+            "User-Agent": "zip-to-git/3.0",
             "Connection": "keep-alive",
         }
 
@@ -931,13 +931,13 @@ class Deployer:
     def _initialize_branch(self) -> tuple[str, str]:
         log(f"Branch '{self.branch}' not found — initializing repository...", "warn")
         content = base64.b64encode(
-            b"# Project Repository\n\nInitialized automatically by GitHub ZIP Deployer.\n"
+            b"# Project Repository\n\nInitialized automatically by Zip to git.\n"
         ).decode()
         self.gh.request(
             "PUT",
             "/contents/README.md",
             {
-                "message": "Initial commit by GitHub ZIP Deployer",
+                "message": "Initial commit by Zip to git",
                 "content": content,
                 "branch": self.branch,
             },
@@ -1063,7 +1063,7 @@ class Deployer:
         ]
         chunks = pack_bulk_additions(additions)
         branch = (
-            f"zip-deployer/stage-{os.getpid()}-"
+            f"zip-to-git/stage-{os.getpid()}-"
             f"{random.getrandbits(48):012x}"
         )
         log(
@@ -1436,7 +1436,7 @@ def main(argv=None) -> int:
     QUIET = args.quiet
 
     if not args.quiet:
-        print(f"\n{C.CYAN}{C.BOLD}GitHub ZIP Deployer — fast edition{C.RESET}\n")
+        print(f"\n{C.CYAN}{C.BOLD}Zip to git — fast edition{C.RESET}\n")
 
     zip_path = args.zip_path or prompt("Path to ZIP file")
     while not Path(zip_path).is_file():

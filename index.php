@@ -18,7 +18,7 @@ function githubRequest($token, $owner, $repo, $endpoint, $method = 'GET', $data 
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, $url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_USERAGENT, 'GitHub-ZIP-Deployer');
+    curl_setopt($ch, CURLOPT_USERAGENT, 'Zip-to-git');
     curl_setopt($ch, CURLOPT_HTTPHEADER, [
         "Authorization: Bearer {$token}",
         "Accept: application/vnd.github.v3+json",
@@ -50,7 +50,7 @@ function readInput($prompt, $secret = false) {
     return $line;
 }
 
-echo "\n\033[36m\033[1m🚀 GitHub ZIP Deployer — Tool by Icii White\033[0m\n\n";
+echo "\n\033[36m\033[1m🚀 Zip to git — Tool by Icii White\033[0m\n\n";
 
 do {
     $token = readInput("\033[33m🔑 Personal Access Token (repo scope): \033[0m");
@@ -105,9 +105,9 @@ try {
 } catch (Exception $e) {
     logMessage("Branch '{$branch}' not found or repository empty. Attempting initialization...", 'warn');
     try {
-        $readmeContent = base64_encode("# Project Repository\nInitialized automatically by GitHub ZIP Deployer.");
+        $readmeContent = base64_encode("# Project Repository\nInitialized automatically by Zip to git.");
         githubRequest($token, $owner, $repo, "/contents/README.md", 'PUT', [
-            'message' => 'Initial commit by GitHub ZIP Deployer',
+            'message' => 'Initial commit by Zip to git',
             'content' => $readmeContent,
             'branch' => $branch
         ]);
@@ -136,7 +136,7 @@ for ($i = 0; $i < $total; $i += $batchSize) {
         $ch = curl_init();
         curl_setopt($ch, CURLOPT_URL, $url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_USERAGENT, 'GitHub-ZIP-Deployer');
+        curl_setopt($ch, CURLOPT_USERAGENT, 'Zip-to-git');
         curl_setopt($ch, CURLOPT_POST, true);
         curl_setopt($ch, CURLOPT_HTTPHEADER, [
             "Authorization: Bearer {$token}",

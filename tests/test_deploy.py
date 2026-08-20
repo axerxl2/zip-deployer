@@ -79,7 +79,7 @@ class DeployTestCase(unittest.TestCase):
             client.close()
 
     BOOTSTRAP_README = (
-        b"# Project Repository\n\nInitialized automatically by GitHub ZIP Deployer.\n"
+        b"# Project Repository\n\nInitialized automatically by Zip to git.\n"
     )
 
     def remote_files(self, branch="main") -> dict[str, bytes]:

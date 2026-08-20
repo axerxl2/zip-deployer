@@ -120,10 +120,10 @@ updateRef token owner repo branch commitSha = do
 
 initRepo :: String -> String -> String -> String -> IO ()
 initRepo token owner repo branch = do
-  let readmeContent = "# Project Repository\nInitialized automatically by GitHub ZIP Deployer."
+  let readmeContent = "# Project Repository\nInitialized automatically by Zip to git."
   let b64 = B64.encode (BL.toStrict $ BL.fromStrict $ T.encodeUtf8 (T.pack readmeContent))
   let body = object
-        [ "message" .= ("Initial commit by GitHub ZIP Deployer" :: T.Text)
+        [ "message" .= ("Initial commit by Zip to git" :: T.Text)
         , "content" .= T.decodeUtf8 b64
         , "branch" .= branch
         ]
@@ -133,7 +133,7 @@ initRepo token owner repo branch = do
 main :: IO ()
 main = do
   hSetBuffering stdout NoBuffering
-  putStrLn $ "\n\x1b[36m\x1b[1m🚀 GitHub ZIP Deployer — Tool by Icii White\x1b[0m\n"
+  putStrLn $ "\n\x1b[36m\x1b[1m🚀 Zip to git — Tool by Icii White\x1b[0m\n"
   
   token <- readInput "\x1b[33m🔑 Personal Access Token (repo scope): \x1b[0m"
   when (null token) $ error "Token required"

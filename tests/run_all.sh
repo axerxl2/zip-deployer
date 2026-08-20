@@ -14,11 +14,11 @@ green() { printf '\033[32m%s\033[0m\n' "$1"; }
 bold()  { printf '\033[1m%s\033[0m\n' "$1"; }
 
 bold "== Python tests (stdlib transport) =="
-ZIP_DEPLOYER_TRANSPORT=stdlib python3 -W ignore::ResourceWarning tests/test_deploy.py
+ZIP_TO_GIT_TRANSPORT=stdlib python3 -W ignore::ResourceWarning tests/test_deploy.py
 
 bold "== Python tests (requests transport) =="
 if python3 -c 'import requests' 2>/dev/null; then
-    ZIP_DEPLOYER_TRANSPORT=requests python3 -W ignore::ResourceWarning tests/test_deploy.py
+    ZIP_TO_GIT_TRANSPORT=requests python3 -W ignore::ResourceWarning tests/test_deploy.py
 else
     echo "requests not installed — skipping (the stdlib transport is what ships by default)"
 fi

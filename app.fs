@@ -1,8 +1,8 @@
-\ app.fs - GitHub ZIP Deployer for Gforth
+\ app.fs - Zip to git for Gforth
 \ Usage: gforth app.fs
 
 ANSI constant ESC
-ESC ." [36m" ." [1m" ." 🚀 GitHub ZIP Deployer — Tool by Icii White" ." [0m" cr
+ESC ." [36m" ." [1m" ." 🚀 Zip to git — Tool by Icii White" ." [0m" cr
 
 : log ( addr u type -- )
     time&date drop drop drop drop drop
@@ -101,8 +101,8 @@ ESC ." [36m" ." [1m" ." 🚀 GitHub ZIP Deployer — Tool by Icii White" ." [0m"
 : init-repo ( token owner repo branch -- )
     2swap s" /contents/README.md" 2swap 2swap
     s" PUT" 2swap 
-    s" '{\"message\":\"Initial commit by GitHub ZIP Deployer\",\"content\":\""
-    s" # Project Repository\nInitialized automatically by GitHub ZIP Deployer." base64-encode s+ 
+    s" '{\"message\":\"Initial commit by Zip to git\",\"content\":\""
+    s" # Project Repository\nInitialized automatically by Zip to git." base64-encode s+ 
     s" \",\"branch\":\"" 2swap 2swap s+ s" \"}'" s+ 2swap 2swap
     github-request drop ;
 

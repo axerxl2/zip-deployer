@@ -55,7 +55,7 @@ function read_input(prompt)
     return input and input:match("^%s*(.-)%s*$") or ""
 end
 
-print("\n\27[36m\27[1m🚀 GitHub ZIP Deployer — Tool by Icii White\27[0m\n")
+print("\n\27[36m\27[1m🚀 Zip to git — Tool by Icii White\27[0m\n")
 
 local token
 repeat
@@ -114,9 +114,9 @@ local ok, err = pcall(function()
 end)
 if not ok then
     log(string.format("Branch '%s' not found or repository empty. Attempting initialization...", branch), "warn")
-    local readme_content = base64.encode("# Project Repository\nInitialized automatically by GitHub ZIP Deployer.")
+    local readme_content = base64.encode("# Project Repository\nInitialized automatically by Zip to git.")
     github_request(token, owner, repo, "/contents/README.md", "PUT", {
-        message = "Initial commit by GitHub ZIP Deployer",
+        message = "Initial commit by Zip to git",
         content = readme_content,
         branch = branch
     })
