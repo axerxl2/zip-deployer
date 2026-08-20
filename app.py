@@ -197,21 +197,125 @@ class C:
 
 _log_lock = threading.Lock()
 QUIET = False
+PROGRESS = None  # set by main() when a live progress bar is active
 
 
 def log(message: str, level: str = "info") -> None:
-    if QUIET and level == "info":
+    if QUIET and level in ("info", "req"):
         return
     icon, color = {
         "error": ("x", C.RED),
         "success": ("+", C.GREEN),
         "warn": ("!", C.YELLOW),
+        "req": (">", C.DIM),
     }.get(level, ("-", C.CYAN))
     stamp = time.strftime("%H:%M:%S")
     with _log_lock:
         stream = sys.stderr if level == "error" else sys.stdout
+        if PROGRESS is not None:
+            PROGRESS._clear_locked()
         print(f"{C.DIM}[{stamp}]{C.RESET} {color}{icon} {message}{C.RESET}", file=stream)
         stream.flush()
+        if PROGRESS is not None:
+            PROGRESS._render_locked(force=True)
+
+
+class ProgressBar:
+    """A single-line, real-time terminal progress bar.
+
+    Thread-safe (upload workers report from many threads) and coordinated
+    with log(): log lines clear the bar, print, and redraw it, so the bar
+    always stays pinned to the bottom of the output.
+    """
+
+    WIDTH = 26
+
+    def __init__(self, enabled: bool = True, stream=None):
+        self.stream = stream or sys.stdout
+        self.enabled = enabled and self.stream.isatty()
+        self.fraction = 0.0
+        self.label = "Starting"
+        self.detail = ""
+        self.requests = 0
+        self.started = time.monotonic()
+        self._visible = False
+        self._last_render = 0.0
+        self._done = False
+
+    def update(self, fraction=None, label=None, detail=None, force=False) -> None:
+        if not self.enabled or self._done:
+            return
+        with _log_lock:
+            if fraction is not None:
+                # Never move backwards: overlapping phases report progress
+                # out of order by a hair; a bar that jumps back looks broken.
+                self.fraction = max(self.fraction, min(max(fraction, 0.0), 1.0))
+            if label is not None:
+                self.label = label
+            if detail is not None:
+                self.detail = detail
+            self._render_locked(force=force)
+
+    def bump_requests(self, total: int) -> None:
+        if not self.enabled or self._done:
+            return
+        with _log_lock:
+            self.requests = total
+            self._render_locked()
+
+    def finish(self, label: str = "Done") -> None:
+        if not self.enabled or self._done:
+            return
+        with _log_lock:
+            self.fraction = 1.0
+            self.label = label
+            self.detail = ""
+            self._render_locked(force=True)
+            self.stream.write("\n")
+            self.stream.flush()
+            self._visible = False
+            self._done = True
+
+    def abort(self) -> None:
+        """Remove the bar (e.g. on error) so the traceback prints cleanly."""
+        if not self.enabled:
+            return
+        with _log_lock:
+            self._clear_locked()
+            self._done = True
+
+    # -- internals (call only while holding _log_lock) ---------------------
+
+    def _clear_locked(self) -> None:
+        if self.enabled and self._visible:
+            self.stream.write("\r\033[K")
+            self.stream.flush()
+            self._visible = False
+
+    def _render_locked(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_render < 0.05:  # ~20 fps cap
+            return
+        self._last_render = now
+        elapsed = now - self.started
+        f = self.fraction
+        filled = int(f * self.WIDTH)
+        bar = "#" * filled + "-" * (self.WIDTH - filled)
+        parts = [f"{elapsed:5.1f}s"]
+        if self.detail:
+            parts.append(self.detail)
+        if self.requests:
+            parts.append(f"{self.requests} req")
+        if 0.02 < f < 1.0:
+            eta = elapsed * (1.0 - f) / f
+            parts.append(f"ETA {eta:.0f}s")
+        line = (
+            f"\r\033[K{C.CYAN}[{bar}]{C.RESET} {C.BOLD}{f * 100:5.1f}%{C.RESET} "
+            f"{self.label}  {C.DIM}{' | '.join(parts)}{C.RESET}"
+        )
+        self.stream.write(line)
+        self.stream.flush()
+        self._visible = True
 
 
 def human_bytes(n: int) -> str:
@@ -472,6 +576,10 @@ class GitHubClient:
         self.budget = PointBudget(points_per_min)
         self.requests_made = 0
         self._counter_lock = threading.Lock()
+        # Optional observer: called after every completed HTTP round trip as
+        # on_request(method, label, status, elapsed_ms, sent_bytes, total).
+        # Used by the CLI for --log-requests and the live request counter.
+        self.on_request = None
 
     @staticmethod
     def _derive_graphql_base(api_base: str) -> str:
@@ -529,6 +637,7 @@ class GitHubClient:
             headers = self._headers()
             if body is not None:
                 headers["Content-Length"] = str(len(body))
+            t_req = time.monotonic()
             try:
                 resp = self.transport.request(method, url, headers, body, self.timeout)
             except Exception as exc:  # network hiccup: retry
@@ -540,6 +649,15 @@ class GitHubClient:
 
             with self._counter_lock:
                 self.requests_made += 1
+                total = self.requests_made
+            hook = self.on_request
+            if hook is not None:
+                try:
+                    hook(method, label or url, resp.status,
+                         (time.monotonic() - t_req) * 1000.0,
+                         len(body) if body else 0, total)
+                except Exception:
+                    pass  # an observer must never break the deploy
 
             if 200 <= resp.status < 300:
                 return resp.json() if resp.status != 204 else None
@@ -641,8 +759,17 @@ def mode_for(info: zipfile.ZipInfo) -> str:
     return MODE_FILE
 
 
-def read_zip(zip_bytes: bytes, workers: int = 8, strip_root: bool = False) -> list[FileEntry]:
-    """Extract + hash every usable member, decompressing in parallel."""
+def read_zip(
+    zip_bytes: bytes,
+    workers: int = 8,
+    strip_root: bool = False,
+    progress=None,
+) -> list[FileEntry]:
+    """Extract + hash every usable member, decompressing in parallel.
+
+    `progress(done, total)` is invoked as members complete, so callers can
+    drive a real-time progress bar during extraction and hashing.
+    """
     with zipfile.ZipFile(BytesIO(zip_bytes)) as zf:
         members = []
         for info in zf.infolist():
@@ -670,6 +797,8 @@ def read_zip(zip_bytes: bytes, workers: int = 8, strip_root: bool = False) -> li
                 members = stripped
 
     local = threading.local()
+    open_handles: list[zipfile.ZipFile] = []
+    handles_lock = threading.Lock()
 
     def opener() -> zipfile.ZipFile:
         # zipfile objects are not thread-safe, so give each worker its own view
@@ -678,17 +807,40 @@ def read_zip(zip_bytes: bytes, workers: int = 8, strip_root: bool = False) -> li
         if zf is None:
             zf = zipfile.ZipFile(BytesIO(zip_bytes))
             local.zf = zf
+            with handles_lock:
+                open_handles.append(zf)
         return zf
 
     def extract(member):
         path, info, mode = member
         return FileEntry(path, opener().read(info), mode)
 
-    n_workers = max(1, min(workers, len(members)))
-    if n_workers == 1:
-        return [extract(m) for m in members]
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        return list(pool.map(extract, members, chunksize=16))
+    total = len(members)
+    n_workers = max(1, min(workers, total))
+    try:
+        if n_workers == 1:
+            entries = []
+            for i, m in enumerate(members, 1):
+                entries.append(extract(m))
+                if progress:
+                    progress(i, total)
+            return entries
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            entries = []
+            for entry in pool.map(extract, members, chunksize=16):
+                entries.append(entry)
+                if progress:
+                    progress(len(entries), total)
+            return entries
+    finally:
+        # Close every per-thread handle; leaking them raises ResourceWarnings
+        # and holds the buffer's file views alive longer than needed.
+        with handles_lock:
+            for zf in open_handles:
+                try:
+                    zf.close()
+                except Exception:
+                    pass
 
 
 # --------------------------------------------------------------------------
@@ -738,6 +890,7 @@ class Deployer:
         bulk: bool = True,
         verify: bool = True,
         prune: bool = False,
+        progress=None,
     ):
         self.gh = client
         self.branch = branch
@@ -747,6 +900,23 @@ class Deployer:
         self.verify = verify
         self.prune = prune
         self._staging_branches: list[str] = []
+        # progress(fraction, label, detail) drives a real-time progress bar.
+        self._progress = progress or (lambda *a, **k: None)
+        self._span = (0.0, 1.0, "Working")
+
+    # -- progress ----------------------------------------------------------
+
+    def _phase(self, lo: float, hi: float, label: str, detail: str = "") -> None:
+        """Enter a weighted phase of the deploy; report its start."""
+        self._span = (lo, hi, label)
+        self._progress(lo, label, detail)
+
+    def _tick(self, done: int, total: int, detail: str | None = None) -> None:
+        """Report completion within the current phase."""
+        lo, hi, label = self._span
+        ratio = (done / total) if total else 1.0
+        text = detail if detail is not None else (f"{done}/{total}" if total else "")
+        self._progress(lo + (hi - lo) * ratio, label, text)
 
     # -- branch resolution -------------------------------------------------
 
@@ -908,9 +1078,12 @@ class Deployer:
             self._staging_branches.append(branch)
             head = parent_commit
             calls = 0
+            staged_files = 0
             for index, chunk in enumerate(chunks, 1):
                 head, used = self._stage_bulk_chunk(chunk, branch, head, index)
                 calls += used
+                staged_files += len(chunk)
+                self._tick(staged_files, len(todo), f"{staged_files}/{len(todo)} binary files")
                 if len(chunks) > 1:
                     log(f"  -> bulk batch {index}/{len(chunks)} ({len(chunk)} files)")
             commit = self.gh.request("GET", f"/git/commits/{head}")
@@ -963,9 +1136,11 @@ class Deployer:
             with lock:
                 mapping[entry.sha] = returned
                 done += 1
-                if done % 25 == 0 or done == total:
-                    rate = done / max(time.monotonic() - started, 1e-6)
-                    log(f"  -> {done}/{total} blobs ({rate:.1f}/s)")
+                current = done
+            self._tick(current, total, f"{current}/{total} blobs")
+            if current % 25 == 0 or current == total:
+                rate = current / max(time.monotonic() - started, 1e-6)
+                log(f"  -> {current}/{total} blobs ({rate:.1f}/s)")
 
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
             list(pool.map(upload, todo))
@@ -987,8 +1162,11 @@ class Deployer:
         log(f"Writing {len(tree_items)} tree entries in {len(chunks)} request(s)...")
         tree_sha = base_tree
         planned = len(chunks)
+        written = 0
         for index, chunk in enumerate(chunks, 1):
             tree_sha = self._post_tree_chunk(chunk, tree_sha, result)
+            written += len(chunk)
+            self._tick(written, len(tree_items), f"{written}/{len(tree_items)} tree entries")
             if planned > 1:
                 log(f"  -> tree chunk {index}/{planned} ({len(chunk)} entries)")
         return tree_sha
@@ -1052,9 +1230,11 @@ class Deployer:
             )
 
         log(f"Resolving branch '{self.branch}'...")
+        self._phase(0.02, 0.05, "Resolving branch")
         parent_commit, base_tree = self.resolve_branch()
 
         log("Reading existing tree to skip unchanged files...")
+        self._phase(0.05, 0.08, "Reading existing tree")
         existing_by_path, known_shas, truncated = self.fetch_existing(base_tree)
         if truncated:
             log("Existing tree listing was truncated; some files may be re-uploaded.", "warn")
@@ -1080,6 +1260,7 @@ class Deployer:
 
         if not changed and not deletions:
             log("Nothing to do — the branch already matches this ZIP.", "success")
+            self._progress(1.0, "Already up to date", "")
             result.no_changes = True
             result.duration = time.monotonic() - started
             result.api_requests = self.gh.requests_made
@@ -1109,8 +1290,10 @@ class Deployer:
         # Binary bytes cannot be represented by REST tree `content`. For a
         # handful of them pooled blob POSTs are cheapest; for a large set the
         # GraphQL staging branch packs up to 100 binary files into each write.
+        self._phase(0.10, 0.38, "Bulk-staging binary files")
         bulk_tree, bulk_shas = self.stage_blobs_bulk(needs_upload, parent_commit, result)
         remaining_uploads = [e for e in needs_upload if e.sha not in bulk_shas]
+        self._phase(0.38, 0.45, "Uploading blobs")
         self.upload_blobs(remaining_uploads, result)
         result.inlined = len(inline_entries)
 
@@ -1133,14 +1316,17 @@ class Deployer:
         # A successful bulk stage already contains its binary additions on top
         # of the original tree. Chaining the regular tree entries onto it folds
         # text, reused objects, deletions, and executable modes into one tree.
+        self._phase(0.50, 0.85, "Writing git tree")
         tree_sha = self.build_tree(tree_items, bulk_tree or base_tree, result)
 
         if self.verify:
             log("Verifying tree contents against locally computed SHAs...")
+            self._progress(0.88, "Verifying content", "")
             expected = {e.path: e.sha for e in changed}
             mismatched = self.verify_tree(tree_sha, expected)
             if mismatched:
                 log(f"{len(mismatched)} entr(ies) did not match — repairing via blob upload.", "warn")
+                self._phase(0.88, 0.92, "Repairing mismatches")
                 by_path = {e.path: e for e in changed}
                 repair = [by_path[p] for p in mismatched if p in by_path]
                 self.upload_blobs(repair, result)
@@ -1156,6 +1342,7 @@ class Deployer:
             log("Verification passed — every file matches byte for byte.", "success")
 
         log("Creating commit...")
+        self._progress(0.94, "Creating commit", "")
         if message is None:
             message = (
                 f"Deploy {len(changed)} file(s) from ZIP\n\n"
@@ -1170,9 +1357,11 @@ class Deployer:
         result.commit_sha = commit["sha"]
 
         log("Updating branch reference...")
+        self._progress(0.98, "Updating branch reference", "")
         self.gh.request(
             "PATCH", f"/git/refs/heads/{self.branch}", {"sha": commit["sha"], "force": False}
         )
+        self._progress(1.0, "Complete", "")
 
         result.duration = time.monotonic() - started
         result.api_requests = self.gh.requests_made
@@ -1233,12 +1422,16 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="drop a single common top-level folder from the archive paths")
     parser.add_argument("--dry-run", action="store_true", help="analyse the ZIP without writing")
     parser.add_argument("--json", action="store_true", help="print a machine-readable summary")
+    parser.add_argument("--log-requests", "-v", action="store_true",
+                        help="log every API request in real time (method, path, status, latency)")
+    parser.add_argument("--no-progress", action="store_true",
+                        help="disable the live progress bar (auto-disabled when not a TTY)")
     parser.add_argument("--quiet", "-q", action="store_true", help="only warnings and errors")
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
-    global QUIET
+    global QUIET, PROGRESS
     args = parse_args(argv)
     QUIET = args.quiet
 
@@ -1263,8 +1456,19 @@ def main(argv=None) -> int:
 
     zip_bytes = Path(zip_path).read_bytes()
     log(f"Reading {zip_path} ({human_bytes(len(zip_bytes))})...")
+
+    progress = ProgressBar(enabled=not args.no_progress and not args.quiet)
+    PROGRESS = progress if progress.enabled else None
+
     t0 = time.monotonic()
-    files = read_zip(zip_bytes, workers=max(4, args.workers), strip_root=args.strip_root)
+    files = read_zip(
+        zip_bytes,
+        workers=max(4, args.workers),
+        strip_root=args.strip_root,
+        progress=lambda done, total: progress.update(
+            0.0, "Extracting + hashing archive", f"{done}/{total} files"
+        ),
+    )
     extract_time = time.monotonic() - t0
     if not files:
         raise SystemExit("No deployable files found in the archive.")
@@ -1275,6 +1479,8 @@ def main(argv=None) -> int:
     )
 
     if args.dry_run:
+        progress.abort()
+        PROGRESS = None
         inlineable = sum(1 for f in files if is_inlineable(f.data, f.path))
         binary = [f for f in files if not is_inlineable(f.data, f.path)]
         unique_binary = {f.sha: f for f in binary}
@@ -1305,6 +1511,20 @@ def main(argv=None) -> int:
         workers=args.workers,
         points_per_min=args.points_per_min,
     )
+
+    # Real-time request telemetry: every HTTP round trip bumps the live
+    # counter on the progress bar; --log-requests additionally prints a
+    # request log line (method, path, status, latency, payload size).
+    log_requests = args.log_requests
+
+    def on_request(method, label, status, elapsed_ms, sent_bytes, total):
+        progress.bump_requests(total)
+        if log_requests:
+            size = f" | {human_bytes(sent_bytes)} sent" if sent_bytes else ""
+            log(f"req #{total:<3} {method:<6} {label} -> {status} in {elapsed_ms:.0f} ms{size}", "req")
+
+    client.on_request = on_request
+
     deployer = Deployer(
         client,
         branch=branch,
@@ -1313,16 +1533,29 @@ def main(argv=None) -> int:
         bulk=not args.no_bulk,
         verify=not args.no_verify,
         prune=args.prune,
+        progress=progress.update,
     )
 
     log(f"Target: {owner}/{repo} on branch '{branch}'")
+    # ETA is most useful when it measures the deploy itself, not the
+    # local extraction that already finished.
+    progress.started = time.monotonic()
     try:
         result = deployer.deploy(files, message=args.message)
     except GitHubError as exc:
+        progress.abort()
+        PROGRESS = None
         log(str(exc), "error")
         return 1
+    except BaseException:
+        progress.abort()
+        PROGRESS = None
+        raise
     finally:
         client.close()
+
+    progress.finish("Deployed" if not result.no_changes else "Already up to date")
+    PROGRESS = None
 
     if not result.no_changes:
         rate = result.total_files / max(result.duration, 1e-6)

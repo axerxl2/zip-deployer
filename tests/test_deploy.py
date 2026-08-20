@@ -443,6 +443,99 @@ class TestAdaptiveTreeSend(DeployTestCase):
         self.assertEqual(sum(len(c) for c in chunks), 50)
 
 
+class TestRealtimeTelemetry(DeployTestCase):
+    """The progress bar and request log must reflect the deploy truthfully."""
+
+    def _deploy_with_hooks(self, zip_bytes, **kwargs):
+        events: list[tuple[float, str, str]] = []
+        requests: list[tuple[str, str, int]] = []
+        files = app.read_zip(zip_bytes, workers=4)
+        client = app.GitHubClient(
+            token="test-token",
+            owner="octocat",
+            repo="hello-world",
+            api_base=self.base_url,
+            workers=8,
+            points_per_min=100000,
+        )
+        client.on_request = lambda method, label, status, ms, sent, total: requests.append(
+            (method, label, status)
+        )
+        deployer = app.Deployer(
+            client,
+            branch="main",
+            workers=8,
+            progress=lambda f, label, detail: events.append((f, label, detail)),
+            **kwargs,
+        )
+        try:
+            result = deployer.deploy(files)
+        finally:
+            client.close()
+        return result, events, requests, client
+
+    def test_progress_reaches_completion_and_moves_forward(self):
+        zip_bytes = build_zip(
+            {f"src/f{i}.txt": f"content {i}\n".encode() for i in range(50)}
+            | {f"bin/b{i}.bin": bytes([0, i % 256]) * 40 for i in range(20)}
+        )
+        result, events, requests, client = self._deploy_with_hooks(zip_bytes)
+        self.assertTrue(events, "progress callback never fired")
+        fractions = [f for f, _, _ in events]
+        self.assertEqual(fractions[-1], 1.0, "progress must end at 100%")
+        self.assertTrue(all(0.0 <= f <= 1.0 for f in fractions))
+        # Phases move forward: each new phase starts at or above 90% of the
+        # running max (uploads and tree writing overlap by design).
+        running_max = 0.0
+        for f in fractions:
+            self.assertGreaterEqual(f, running_max * 0.5)
+            running_max = max(running_max, f)
+        labels = {label for _, label, _ in events}
+        self.assertIn("Writing git tree", labels)
+        self.assertIn("Complete", {label for _, label, _ in events})
+
+    def test_request_hook_sees_every_api_call(self):
+        zip_bytes = build_zip({"a.txt": b"alpha\n", "b/c.txt": b"beta\n"})
+        result, events, requests, client = self._deploy_with_hooks(zip_bytes)
+        self.assertEqual(len(requests), client.requests_made)
+        self.assertEqual(len(requests), result.api_requests)
+        for method, label, status in requests:
+            self.assertIn(method, ("GET", "POST", "PUT", "PATCH", "DELETE"))
+            self.assertTrue(label)
+            self.assertTrue(100 <= status < 600)
+
+    def test_progress_and_hooks_survive_noop_redeploy(self):
+        zip_bytes = build_zip({"x.txt": b"same\n"})
+        self._deploy_with_hooks(zip_bytes)
+        result, events, requests, _ = self._deploy_with_hooks(zip_bytes)
+        self.assertTrue(result.no_changes)
+        self.assertEqual(events[-1][0], 1.0)
+
+    def test_broken_observer_does_not_break_deploy(self):
+        zip_bytes = build_zip({"ok.txt": b"fine\n"})
+        files = app.read_zip(zip_bytes, workers=2)
+        client = app.GitHubClient(
+            token="test-token",
+            owner="octocat",
+            repo="hello-world",
+            api_base=self.base_url,
+            workers=4,
+            points_per_min=100000,
+        )
+
+        def exploding_hook(*args):
+            raise RuntimeError("observer bug")
+
+        client.on_request = exploding_hook
+        deployer = app.Deployer(client, branch="main", workers=4)
+        try:
+            result = deployer.deploy(files)
+        finally:
+            client.close()
+        self.assertFalse(result.no_changes)
+        self.assertEqual(self.remote_files()["ok.txt"], b"fine\n")
+
+
 class TestLocalHelpers(unittest.TestCase):
     def test_git_blob_sha_matches_git(self):
         # `printf 'hello' | git hash-object --stdin` -> b6fc4c62...

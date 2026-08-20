@@ -51,6 +51,30 @@ REST tree `content` is UTF-8-only, which used to leave binary-heavy archives on 
 one-POST-per-file path. The bulk GraphQL writer removes that bottleneck: a 3,000-binary
 send uses 30 content mutations rather than 3,000 blob POSTs.
 
+## Real-time progress and request logging
+
+Both the CLI and the browser page report progress live while the deploy runs:
+
+* **Live progress bar** — percentage, current phase (extracting, bulk-staging,
+  writing the tree, verifying, committing), files done, elapsed time, a live
+  API-request counter, and an ETA. The CLI renders it on one terminal line
+  (TTY only; `--no-progress` disables it); the browser shows the same data
+  under the bar as `elapsed · requests · ETA`.
+* **Request log** — every API round trip can be streamed into the log as
+  `req #12 POST /git/trees -> 201 in 1094 ms | 194.3 KB sent`. Enable it with
+  `--log-requests` (or `-v`) in the CLI; in the browser it is the
+  "Log every API request" checkbox (on by default, and the log window trims
+  itself so huge sends stay smooth).
+
+```bash
+python3 app.py --zip site.zip --owner you --repo site --log-requests
+```
+
+A 4,200-file archive (3,800 TypeScript sources + 400 binary assets) deployed
+through the latency-simulating mock with the real 900-points/minute limit
+enforced finishes in **18.2 seconds using 26 API requests**, verified
+byte-for-byte — comfortably inside a 4-minute budget.
+
 ## Measured results
 
 From `tests/benchmark.py`, which runs both implementations against a mock GitHub API that

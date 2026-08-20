@@ -113,6 +113,10 @@
                             <input type="checkbox" id="opt-bulk" checked class="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500">
                             <span><span class="font-medium">Batch binary files (fast)</span><br><span class="text-slate-400 text-xs">Uses short-lived staging branches to avoid one API call per binary.</span></span>
                         </label>
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input type="checkbox" id="opt-reqlog" checked class="mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500">
+                            <span><span class="font-medium">Log every API request</span><br><span class="text-slate-400 text-xs">Streams method, path, status and latency of each call into the log.</span></span>
+                        </label>
                     </div>
                 </div>
                 <hr class="border-slate-100">
@@ -138,9 +142,10 @@
                     <div class="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
                         <div id="progress-bar" class="bg-blue-600 h-2 rounded-full transition-all duration-200" style="width: 0%"></div>
                     </div>
-                    <div class="flex justify-between text-xs text-slate-500">
+                    <div class="flex justify-between gap-2 text-xs text-slate-500">
                         <span id="progress-label">Preparing...</span>
-                        <span id="progress-stats"></span>
+                        <span id="progress-live" class="text-slate-400 tabular-nums"></span>
+                        <span id="progress-stats" class="tabular-nums"></span>
                     </div>
                 </div>
                 <div id="summary" class="hidden grid grid-cols-2 sm:grid-cols-4 gap-3 text-center"></div>
@@ -197,27 +202,86 @@
         const progressWrap = el('progress-wrap');
         const progressBar = el('progress-bar');
         const progressLabel = el('progress-label');
+        const progressLive = el('progress-live');
         const progressStats = el('progress-stats');
         const summaryBox = el('summary');
 
         // ------------------------------------------------------------------
         // UI helpers
         // ------------------------------------------------------------------
+        const MAX_LOG_LINES = 600; // keep the DOM small during huge sends
+        let logLines = 0;
+
         function log(message, type) {
             const time = new Date().toLocaleTimeString();
-            const color = { error: 'text-red-400', success: 'text-emerald-400', warn: 'text-yellow-400' }[type] || 'text-slate-300';
+            const color = { error: 'text-red-400', success: 'text-emerald-400', warn: 'text-yellow-400', dim: 'text-slate-500' }[type] || 'text-slate-300';
             const safe = String(message).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
             // insertAdjacentHTML avoids re-parsing the whole log on every line,
             // which is what made the UI hitch during a 3,000-file send.
             logWindow.insertAdjacentHTML('beforeend', `\n<span class="text-slate-500">[${time}]</span> <span class="${color}">${safe}</span>`);
+            logLines++;
+            // Trim the oldest lines so a 4,000-file request log cannot grow
+            // the DOM without bound and stall scrolling.
+            if (logLines > MAX_LOG_LINES && logWindow.children && logWindow.children.length > MAX_LOG_LINES * 2) {
+                while (logWindow.children.length > MAX_LOG_LINES * 2) {
+                    logWindow.removeChild(logWindow.children[0]);
+                }
+                logLines = Math.floor(logWindow.children.length / 2);
+            }
             logWindow.scrollTop = logWindow.scrollHeight;
+        }
+
+        // --- real-time deploy telemetry ----------------------------------
+        const live = { active: false, started: 0, fraction: 0, requests: 0, timer: null };
+
+        function logRequest(seq, method, path, status, ms) {
+            live.requests = seq;
+            const reqlogEl = el('opt-reqlog');
+            if (reqlogEl && reqlogEl.checked === false) return;
+            log(`req #${seq} ${method} ${path} -> ${status} in ${Math.round(ms)} ms`, 'dim');
+        }
+
+        function renderLive() {
+            if (!live.active) return;
+            const elapsed = (Date.now() - live.started) / 1000;
+            const f = live.fraction;
+            let text = `${elapsed.toFixed(1)}s · ${live.requests} req`;
+            if (f > 0.03 && f < 1) {
+                const eta = elapsed * (1 - f) / f;
+                text += ` · ETA ${eta < 90 ? Math.max(1, Math.round(eta)) + 's' : Math.round(eta / 60) + 'm'}`;
+            }
+            progressLive.textContent = text;
+        }
+
+        function startLiveTicker() {
+            live.active = true;
+            live.started = Date.now();
+            live.fraction = 0;
+            live.requests = 0;
+            progressLive.textContent = '';
+            if (typeof setInterval === 'function') {
+                live.timer = setInterval(renderLive, 250);
+            }
+        }
+
+        function stopLiveTicker() {
+            live.active = false;
+            if (live.timer && typeof clearInterval === 'function') clearInterval(live.timer);
+            live.timer = null;
+            renderLive();
         }
 
         function setProgress(fraction, label, stats) {
             progressWrap.classList.remove('hidden');
-            progressBar.style.width = `${Math.max(0, Math.min(1, fraction)) * 100}%`;
+            // Monotonic while deploying — overlapping phases can report a
+            // hair out of order and a bar that jumps back looks broken.
+            // An explicit 0 (new run / failure) resets it.
+            const f = Math.max(0, Math.min(1, fraction));
+            live.fraction = f === 0 ? 0 : Math.max(live.fraction, f);
+            progressBar.style.width = `${live.fraction * 100}%`;
             if (label !== undefined) progressLabel.textContent = label;
             if (stats !== undefined) progressStats.textContent = stats;
+            renderLive();
         }
 
         function showSummary(cards) {
@@ -389,6 +453,7 @@
                 for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
                     await this.budget.spend(points);
                     let res;
+                    const t0 = Date.now();
                     try {
                         res = await fetch(url, {
                             method,
@@ -408,6 +473,7 @@
                     }
 
                     this.requests++;
+                    logRequest(this.requests, method, path, res.status, Date.now() - t0);
                     if (res.status === 204) return null;
                     if (res.ok) return res.json();
                     if (res.status === 404 && options.allow404) return null;
@@ -438,6 +504,7 @@
                 for (let attempt = 0; attempt <= CONFIG.maxRetries; attempt++) {
                     await this.budget.spend(5);
                     let res;
+                    const t0 = Date.now();
                     try {
                         res = await fetch(url, {
                             method: 'POST',
@@ -456,6 +523,7 @@
                         continue;
                     }
                     this.requests++;
+                    logRequest(this.requests, 'POST', '/graphql', res.status, Date.now() - t0);
                     if (res.ok) {
                         const payload = await res.json();
                         if (payload.errors && payload.errors.length) {
@@ -548,10 +616,12 @@
                 done++;
                 if (done % 32 === 0) await yieldToUi();
                 if (done % 100 === 0 || done === entries.length) {
-                    setProgress(done / entries.length, 'Reading and hashing archive...', `${done} / ${entries.length}`);
+                    // Reading/hashing is the first ~12% of the run; the bar
+                    // must not hit 100% before the deploy has even started.
+                    setProgress(0.12 * (done / entries.length), 'Reading and hashing archive...', `${done} / ${entries.length}`);
                 }
             });
-            files.sort((a, b) => (a.path < b.path ? -1 : 1));
+            files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
             return files;
         }
 
@@ -1003,6 +1073,8 @@
             lucide.createIcons();
             summaryBox.classList.add('hidden');
             log('\n--- Starting New Deployment ---');
+            setProgress(0, 'Preparing...', '');
+            startLiveTicker();
 
             try {
                 const result = await deploy({
@@ -1034,6 +1106,7 @@
                 setProgress(0, 'Failed', '');
                 console.error(error);
             } finally {
+                stopLiveTicker();
                 uploadBtn.disabled = false;
                 uploadBtn.innerHTML = '<i data-lucide="rocket" class="w-5 h-5"></i><span>Deploy to GitHub</span>';
                 lucide.createIcons();
